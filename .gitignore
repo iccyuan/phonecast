@@ -1,0 +1,10 @@
+*.exe
+hub/phonecast-hub-linux-amd64
+viewer/.gradle/
+viewer/build/
+viewer/app/build/
+viewer/local.properties
+viewer/.idea/
+*.exe~
+phonecast.json
+*.log

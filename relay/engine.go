@@ -1,0 +1,313 @@
+// engine: agent 的可启停内核, 供托盘菜单控制。
+// Start 后: 等设备 → push server → 起直连监听 + hub 注册; Stop 取消 ctx 并关掉
+// 全部被跟踪的连接/监听器, 进行中的投屏会话随连接断开经既有 defer 链自然清理。
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"slices"
+	"sync"
+	"time"
+)
+
+var errBadKey = errors.New("hub 拒绝: 密钥错误")
+
+type engine struct {
+	adb, jar string
+
+	mu      sync.Mutex
+	running bool
+	cancel  context.CancelFunc
+	conns   map[io.Closer]struct{}
+	state   string
+	onState func() // 托盘刷新回调 (可为 nil)
+}
+
+func newEngine(adb, jar string) *engine {
+	return &engine{adb: adb, jar: jar, conns: map[io.Closer]struct{}{}, state: "未启动"}
+}
+
+func (e *engine) State() (bool, string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.running, e.state
+}
+
+func (e *engine) setState(s string) {
+	e.mu.Lock()
+	e.state = s
+	cb := e.onState
+	e.mu.Unlock()
+	log.Printf("[状态] %s", s)
+	if cb != nil {
+		cb()
+	}
+}
+
+func (e *engine) track(c io.Closer) {
+	e.mu.Lock()
+	e.conns[c] = struct{}{}
+	e.mu.Unlock()
+}
+
+func (e *engine) untrack(c io.Closer) {
+	e.mu.Lock()
+	delete(e.conns, c)
+	e.mu.Unlock()
+}
+
+func (e *engine) Start() {
+	e.mu.Lock()
+	if e.running {
+		e.mu.Unlock()
+		return
+	}
+	var ctx context.Context
+	ctx, e.cancel = context.WithCancel(context.Background())
+	e.running = true
+	e.mu.Unlock()
+	go e.run(ctx)
+}
+
+func (e *engine) Stop() {
+	e.mu.Lock()
+	if !e.running {
+		e.mu.Unlock()
+		return
+	}
+	e.running = false
+	e.cancel()
+	closers := make([]io.Closer, 0, len(e.conns))
+	for c := range e.conns {
+		closers = append(closers, c)
+	}
+	e.mu.Unlock()
+	for _, c := range closers {
+		c.Close()
+	}
+	e.setState("已停止")
+}
+
+func (e *engine) Restart() {
+	e.Stop()
+	time.Sleep(500 * time.Millisecond)
+	e.Start()
+}
+
+func (e *engine) run(ctx context.Context) {
+	e.setState("等待手机A 接入 (USB 调试)...")
+	if !e.waitForDevice(ctx) {
+		return
+	}
+	if out, err := adbRun(e.adb, "push", e.jar, remoteJarPath); err != nil {
+		log.Printf("adb push 失败: %v\n%s", err, out)
+		alertf("adb push 失败: %v", err)
+		go e.Stop()
+		return
+	}
+	banner()
+	if *listen != "" {
+		go e.serveDirect(ctx)
+	}
+	if *hubAddr != "" {
+		go e.hubLoop(ctx)
+	}
+	e.setState("运行中 · 配对码 " + *room)
+}
+
+// waitForDevice: 没插手机时等待; 多台设备自动选第一台。返回 false 表示被 Stop 打断。
+func (e *engine) waitForDevice(ctx context.Context) bool {
+	waiting := false
+	for ctx.Err() == nil {
+		out, err := adbRun(e.adb, "devices")
+		if err != nil {
+			log.Printf("运行 adb 失败: %v\n%s", err, out)
+			alertf("运行 adb 失败: %v", err)
+			go e.Stop()
+			return false
+		}
+		ready, unauthorized := parseAdbDevices(out)
+		if *serial != "" {
+			if slices.Contains(ready, *serial) {
+				return true
+			}
+		} else if len(ready) > 0 {
+			if len(ready) > 1 {
+				log.Printf("检测到 %d 台设备, 使用第一台: %s (可在配置里用 serial 指定)", len(ready), ready[0])
+			}
+			*serial = ready[0]
+			return true
+		}
+		if !waiting {
+			waiting = true
+			e.setState("等待手机A: 请 USB 连接并开启 USB 调试")
+		}
+		if unauthorized {
+			e.setState("请在手机A 上点「允许 USB 调试」")
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(3 * time.Second):
+		}
+	}
+	return false
+}
+
+// ---- 直连模式 ----
+
+func (e *engine) serveDirect(ctx context.Context) {
+	ln, err := net.Listen("tcp", *listen)
+	if err != nil {
+		log.Printf("[直连] 监听 %s 失败 (端口被占用?): %v", *listen, err)
+		return
+	}
+	e.track(ln)
+	defer func() { e.untrack(ln); ln.Close() }()
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("[直连] accept 失败: %v", err)
+			}
+			return
+		}
+		go e.handleDirectViewer(conn)
+	}
+}
+
+func (e *engine) handleDirectViewer(conn net.Conn) {
+	e.track(conn)
+	defer func() { e.untrack(conn); conn.Close() }()
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+	var magic [4]byte
+	if _, err := io.ReadFull(conn, magic[:]); err != nil || magic != MagicViewer {
+		return
+	}
+	gotKey, err1 := ReadLenPrefixed(conn)
+	gotRoom, err2 := ReadLenPrefixed(conn)
+	if err1 != nil || err2 != nil {
+		return
+	}
+	if gotKey != *key || gotRoom != *room {
+		log.Printf("[直连] %s 密钥/配对码错误, 拒绝", conn.RemoteAddr())
+		time.Sleep(time.Second)
+		conn.Write([]byte{StatusBadKey})
+		return
+	}
+	if !sessionMu.TryLock() {
+		conn.Write([]byte{StatusBusy})
+		return
+	}
+	defer sessionMu.Unlock()
+
+	conn.SetReadDeadline(time.Time{})
+	conn.Write([]byte{StatusOK})
+	log.Printf("[直连] 观看端 %s 接入", conn.RemoteAddr())
+	e.runWatched(conn)
+}
+
+// ---- 中继模式 ----
+
+func (e *engine) hubLoop(ctx context.Context) {
+	for ctx.Err() == nil {
+		err := e.hubRegister()
+		if ctx.Err() != nil {
+			return
+		}
+		if errors.Is(err, errBadKey) {
+			e.setState("密钥错误, 已停止")
+			alertf("hub 拒绝连接: 密钥错误。\n请打开配置文件修正 key, 保存后点「重新运行」。")
+			go e.Stop()
+			return
+		}
+		log.Printf("[中继] %v, 5 秒后重连", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+func (e *engine) hubRegister() error {
+	conn, err := net.DialTimeout("tcp", *hubAddr, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("连接 hub 失败: %w", err)
+	}
+	e.track(conn)
+	defer func() { e.untrack(conn); conn.Close() }()
+
+	if err := WriteRoomHandshake(conn, MagicAgent, *key, *room); err != nil {
+		return err
+	}
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	status, err := ReadStatus(conn)
+	if err != nil {
+		return fmt.Errorf("hub 无响应: %w", err)
+	}
+	if status == StatusBadKey {
+		return errBadKey
+	}
+	log.Printf("[中继] 已注册到 hub %s, 配对码: %s", *hubAddr, *room)
+
+	fw := NewFrameWriter(conn)
+	for {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second)) // hub 每 20s ping 一次
+		ch, payload, err := ReadFrame(conn)
+		if err != nil {
+			return fmt.Errorf("注册连接断开: %w", err)
+		}
+		switch ch {
+		case ChPing:
+			fw.WriteFrame(ChPing)
+		case ChStart:
+			if len(payload) == 16 {
+				go e.hubSession(append([]byte(nil), payload...))
+			}
+		}
+	}
+}
+
+func (e *engine) hubSession(sessionID []byte) {
+	if !sessionMu.TryLock() {
+		return // hub 侧有 busy 拦截, 这里兜底
+	}
+	defer sessionMu.Unlock()
+
+	conn, err := net.DialTimeout("tcp", *hubAddr, 5*time.Second)
+	if err != nil {
+		log.Printf("[中继] 会话连接失败: %v", err)
+		return
+	}
+	e.track(conn)
+	defer func() { e.untrack(conn); conn.Close() }()
+	if err := WriteHandshake(conn, MagicSession, *key, sessionID); err != nil {
+		return
+	}
+	log.Printf("[中继] 会话开始 (id=%x)", sessionID[:4])
+	e.runWatched(conn)
+	log.Printf("[中继] 会话结束 (id=%x)", sessionID[:4])
+}
+
+// runWatched: 包一层状态提示的 runSession。
+// scrcpy-server (cleanup=true) 启动后会删掉自己的 jar, 所以每次会话前必须重新 push,
+// 否则第二次会话 app_process 因 CLASSPATH 失效直接 Abort。
+func (e *engine) runWatched(conn net.Conn) {
+	e.setState("投屏中 · 配对码 " + *room)
+	if out, err := adbRun(e.adb, "push", e.jar, remoteJarPath); err != nil {
+		log.Printf("会话前 adb push 失败: %v\n%s", err, out)
+		e.setState("运行中 · 配对码 " + *room)
+		return
+	}
+	runSession(e.adb, conn)
+	if running, _ := e.State(); running {
+		e.setState("运行中 · 配对码 " + *room)
+	}
+}

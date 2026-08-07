@@ -79,6 +79,20 @@ func handleConn(conn net.Conn) {
 		conn.Close()
 		return
 	}
+
+	// 观看端不再提交 hub 密钥: 真正的凭据(配对码/设备令牌)由 agent 端到端校验,
+	// hub 只按设备名转发字节, 拿不到也用不了观看端的凭据。
+	if magic == MagicViewer {
+		if !sessionLimiter.allow(ip) {
+			log.Printf("[限速] %s 建立会话过于频繁", ip)
+			conn.Close()
+			return
+		}
+		handleViewer(conn)
+		return
+	}
+
+	// agent 注册 / agent 会话连接: 仍需 hub 密钥 (在配置文件里, 不用手输)
 	gotKey, err := ReadLenPrefixed(conn)
 	if err != nil {
 		conn.Close()
@@ -97,8 +111,6 @@ func handleConn(conn net.Conn) {
 	switch magic {
 	case MagicAgent:
 		handleAgent(conn)
-	case MagicViewer:
-		handleViewer(conn)
 	case MagicSession:
 		handleSessionConn(conn)
 	default:
@@ -311,6 +323,33 @@ type limiter struct {
 }
 
 var authLimiter = &limiter{fails: map[string][]time.Time{}}
+
+// sessionLimiter: 观看端建会话的频率闸门 (每 IP 10 分钟 30 次)。
+// 观看端无需 hub 密钥, 靠它挡住拿设备名刷 agent 的行为。
+var sessionLimiter = &rateLimiter{hits: map[string][]time.Time{}}
+
+type rateLimiter struct {
+	mu   sync.Mutex
+	hits map[string][]time.Time
+}
+
+func (l *rateLimiter) allow(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	cutoff := time.Now().Add(-10 * time.Minute)
+	var recent []time.Time
+	for _, t := range l.hits[ip] {
+		if t.After(cutoff) {
+			recent = append(recent, t)
+		}
+	}
+	if len(recent) >= 30 {
+		l.hits[ip] = recent
+		return false
+	}
+	l.hits[ip] = append(recent, time.Now())
+	return true
+}
 
 func (l *limiter) fail(ip string) {
 	l.mu.Lock()

@@ -27,9 +27,13 @@
 
 画质等参数编辑 `phonecast.json` 调整(`max_size`/`bit_rate`/`max_fps`/`audio`/`serial`,`hub` 留空=仅局域网直连,走公网建议码率 2-4 Mbps)。命令行参数仍然可用且优先于配置文件(`-key`/`-room`/`-hub`/`-listen`/`-s` 等,见 `-h`)。`scrcpy-server-v2.7` 放 exe 同目录。
 
+托盘菜单:启动/停止/重新运行、配对码与二维码、**选择被投屏手机**(一台电脑插多台时切换)、检查更新、日志、hub 状态页。
+
 ### 手机B (viewer)
 
-装 `viewer/app/build/outputs/apk/debug/app-debug.apk`,填 **地址**(hub 或电脑 IP:端口)、**密钥**、**配对码**,连接即投屏。无 WiFi 也可 USB 直连电脑:`adb reverse tcp:27184 tcp:27184` 后地址填 `127.0.0.1:27184`。
+装 `phonecast-viewer.apk`。主页是**已配对手机列表**(显示真实机型),点条目直接连;右下角「+」手动添加(地址 / 设备名 / 6 位配对码)。最省事的是扫电脑托盘里的**配对二维码**,自动完成配对并连接。无 WiFi 也可 USB 直连电脑:`adb reverse tcp:27184 tcp:27184` 后地址填 `127.0.0.1:27184`。
+
+两端都支持在线更新:电脑端托盘「检查更新」可自动下载替换并重启;App 内「检查更新」会引导下载新 APK。
 
 ### 云端 hub
 
@@ -66,17 +70,32 @@ WantedBy=multi-user.target
 
 ## 安全模型
 
-- 所有接入(agent 注册 / viewer / agent 会话连接 / HTTP 状态页)必须携带 **密钥**;常量时间比对,失败延迟 1s 断开,同 IP 失败 5 次锁 10 分钟。
-- viewer 还须提供正确 **配对码** 才能匹配到手机A —— 密钥+配对码双因素,拿不全就无法观看/控制。
-- 会话连接凭 16 字节一次性随机 session id 认领;状态页上配对码打码显示。
+手机端只需输 **6 位配对码**,长密钥不用手打:
+
+| 凭据 | 谁用 | 形态 |
+|---|---|---|
+| hub 密钥 | agent↔hub 注册、状态页登录 | 长随机串,只存在配置文件/env 里,永不手输 |
+| 配对码 | 手机首次配对 | 6 位数字,30 分钟有效,可随时在托盘重生成 |
+| 设备令牌 | 手机后续连接 | 32 字节随机,配对成功后自动下发并记住 |
+
+- **配对码与令牌不上线**:agent 发 16 字节随机 nonce,手机回 `HMAC-SHA256(凭据, nonce)`。中继服务器与链路窃听者都拿不到可复用的凭据,也无法冒充观看端(**端到端认证,hub 零信任**)。
+- **抗爆破**:配对码连错 5 次即自动作废并重新生成;每次失败延迟 1 秒。6 位数字在这个约束下足够安全。
+- **设备名(room)不是密码**,只是 hub 上的路由标识;知道设备名也过不了认证。hub 对观看端有建连频率限制(每 IP 10 分钟 30 次)。
+- **可撤销**:托盘「撤销已配对手机」清空全部令牌,所有手机需重新配对。
+- 状态页需登录(密钥 → 12 小时 Cookie),脚本可用 `Authorization: Bearer`;失败同样限速锁定。设备名在页面上打码。
 - hub 以 `User=nobody` + systemd 沙箱(ProtectSystem=strict 等)运行。
-- **边界**:传输是明文 TCP,密钥与媒体流未加密——能嗅探你链路的人可以看到画面。要过不可信网络建议套 TLS/WireGuard,尚未内置。
+- **边界**:传输是明文 TCP,媒体流未加密——能嗅探你链路的人可以看到画面(但拿不到凭据、无法反控)。要过不可信网络建议套 WireGuard,尚未内置。
 
-## 协议 v2(agent↔viewer↔hub 同一套)
+## 协议 v3(agent↔viewer↔hub 同一套)
 
-握手(连接方先发):`magic(4B) + u8 keyLen + key + 载荷`,magic:
-- `PCV2` viewer 接入,载荷 `u8 roomLen + room` → 回 1 字节状态(0=ok 1=密钥错 2=配对码不在线 3=已有观看端 4=hub 错误)
-- `PCA2` agent 注册(载荷同上);`PCS2` agent 会话连接(载荷=16B session id)
+握手(连接方先发):
+- `PCV3` viewer 接入:`magic + u8 roomLen + room`(**不带密钥**)→ 回 1 字节状态(0=ok 2=设备名不在线 3=已有观看端 4=hub 错误)
+- `PCA3` agent 注册:`magic + u8 keyLen + key + u8 roomLen + room`;`PCS3` agent 会话连接:`magic + key + 16B session id`
+
+viewer 握手成功后,先做端到端认证再进媒体流:
+- **ch0x20 挑战**(agent→viewer):16B 随机 nonce
+- **ch0x21 应答**(viewer→agent):`u8 kind(0=配对码 1=设备令牌) + 32B HMAC-SHA256(凭据, nonce)`
+- **ch0x22 结果**(agent→viewer):`u8 状态` +(首次配对成功时)64 字符 hex 设备令牌
 
 之后统一帧 `[u8 ch][u32 len][payload]`:
 - **ch0 视频**:首帧 12B codec meta(`u32 codecId + u32 w + u32 h`),之后 `[8B ptsAndFlags(bit63=config, bit62=关键帧)][H.264 ES]`
@@ -100,7 +119,8 @@ cd viewer; .\gradlew.bat :app:assembleDebug          # App (Gradle 8.9/AGP 8.5.2
 
 ## 已知边界
 
-- 单观看端(scrcpy-server 单实例);viewer 退后台即断开,重进重连。
+- **一台电脑同时只投一台手机**:scrcpy-server 单实例,插多台时在托盘「选择被投屏手机」里切换(切换会重启会话)。同一时刻也只允许一个观看端。
+- viewer 退后台即断开,重进重连。
 - 音频需手机A Android 11+,不满足时自动降级为仅视频。
 - 手机A 旋转:解码器动态分辨率切换,新 SPS/PPS 内联送入;个别机型解码器不支持 DRC 时需重建 codec(未遇到再处理)。
 - 音画各自低延迟播放,无严格同步时钟。

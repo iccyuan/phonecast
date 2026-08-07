@@ -32,6 +32,8 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
     private val poison = Packet(false, -1, ByteArray(0))
 
     private lateinit var client: StreamClient
+    private var addr = ""
+    private var room = ""
     private val audioPlayer = AudioPlayer()
     private lateinit var container: FrameLayout
     private lateinit var surfaceView: SurfaceView
@@ -55,8 +57,9 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
             setOnTouchListener { v, ev -> handleTouch(v.width, v.height, ev); true }
         }
         statusText = TextView(this).apply {
-            text = "连接中..."
-            setTextColor(Color.WHITE)
+            text = "正在连接..."
+            setTextColor(Ui.MUTED)
+            textSize = 14f
         }
         container = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -68,31 +71,36 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
 
         val navBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(0xFF202020.toInt())
+            setBackgroundColor(0xFF161A22.toInt())
+            // 前三个键发给【被投屏的手机】, 最后一个是退出本次投屏(本机)
             for ((label, code) in listOf(
-                "◁" to ControlMessages.KEYCODE_BACK,
-                "○" to ControlMessages.KEYCODE_HOME,
-                "▢" to ControlMessages.KEYCODE_APP_SWITCH,
+                "‹  返回" to ControlMessages.KEYCODE_BACK,
+                "主页" to ControlMessages.KEYCODE_HOME,
+                "多任务" to ControlMessages.KEYCODE_APP_SWITCH,
             )) {
-                addView(Button(context).apply {
-                    text = label
+                addView(Ui.flatButton(context, label, Ui.TEXT).apply {
                     setOnClickListener { ControlMessages.keyPress(code).forEach(client::send) }
                 }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
             }
+            addView(Ui.flatButton(context, "✕ 断开", Ui.MUTED).apply {
+                setOnClickListener { finish() }
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
         }
 
         setContentView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.BLACK)
             addView(container, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
             addView(navBar, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                (48 * resources.displayMetrics.density).toInt()))
+                LinearLayout.LayoutParams.MATCH_PARENT, Ui.dp(context, 52)))
         })
 
+        addr = intent.getStringExtra("addr") ?: ""
+        room = intent.getStringExtra("room") ?: ""
         client = StreamClient(
             intent.getStringExtra("host")!!, intent.getIntExtra("port", 27184),
-            intent.getStringExtra("key") ?: "", intent.getStringExtra("room") ?: "", this)
+            room, intent.getStringExtra("code") ?: "", Tokens.get(this, addr, room), this)
         client.start()
         thread(name = "decoder-input") { runDecoder() }
     }
@@ -100,7 +108,20 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
     // ---- StreamClient.Listener (非 UI 线程) ----
 
     override fun onConnected() {
-        runOnUiThread { statusText.text = "已连接, 等待画面..." }
+        runOnUiThread { statusText.text = "已连接,等待画面..." }
+    }
+
+    override fun onPaired(token: String) {
+        Tokens.put(this, addr, room, token)
+        runOnUiThread { Toast.makeText(this, "配对成功,下次无需再输配对码", Toast.LENGTH_SHORT).show() }
+    }
+
+    override fun onTokenRejected() {
+        Tokens.clear(this, addr, room)
+    }
+
+    override fun onDeviceName(name: String) {
+        Saved.setName(this, addr, room, name)
     }
 
     override fun onAudioPacket(isConfig: Boolean, ptsUs: Long, data: ByteArray) {

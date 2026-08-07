@@ -16,8 +16,10 @@ import (
 const defaultHub = ""
 
 type config struct {
-	Key     string `json:"key"`
-	Room    string `json:"room"`
+	Key     string `json:"key"`  // hub 接入密钥 (长, 只在配置文件里, 不用手输)
+	Room    string `json:"room"` // 设备名: 公开路由标识, 非密码
+	// 已配对手机的设备令牌; 由程序自动维护, 托盘菜单可一键撤销。
+	Devices []string `json:"devices,omitempty"`
 	Hub     string `json:"hub"`
 	Listen  string `json:"listen"`
 	Serial  string `json:"serial,omitempty"`
@@ -41,7 +43,8 @@ func loadConfig() *config {
 	path := configPath()
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return firstRunWizard(path)
+		loadedCfg = firstRunWizard(path)
+		return loadedCfg
 	}
 	if err != nil {
 		die("读取配置 %s 失败: %v", path, err)
@@ -50,10 +53,11 @@ func loadConfig() *config {
 	if err := json.Unmarshal(data, cfg); err != nil {
 		die("配置 %s 不是合法 JSON: %v\n(删掉该文件重新运行可重新生成)", path, err)
 	}
-	if cfg.Room == "" { // 配对码固定下来, 手机B 不用每次重填
+	if cfg.Room == "" { // 设备名固定下来, 手机B 不用每次重填
 		cfg.Room = randomToken(3)
 		saveConfig(path, cfg)
 	}
+	loadedCfg = cfg
 	return cfg
 }
 
@@ -125,6 +129,18 @@ func saveConfig(path string, cfg *config) {
 	if err := os.WriteFile(path, append(data, '\n'), 0600); err != nil {
 		die("写入配置 %s 失败: %v", path, err)
 	}
+}
+
+// loadedCfg: 供 persistDevices 回写 (设备令牌变化时)。
+var loadedCfg *config
+
+// persistDevices: 把已配对设备令牌写回配置文件, 重启后依然免输配对码。
+func persistDevices(devices []string) {
+	if loadedCfg == nil {
+		return
+	}
+	loadedCfg.Devices = devices
+	saveConfig(configPath(), loadedCfg)
 }
 
 // applyConfig: 未在命令行显式指定的参数, 用配置文件的值覆盖内置默认。

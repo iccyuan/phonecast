@@ -10,6 +10,8 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -26,21 +28,42 @@ const (
 	ChStart   = 0x10 // hub→agent(注册连接), payload=16B session id
 	ChPing    = 0x11 // 注册连接保活, 双向回显
 
-	// 握手响应状态码
-	StatusOK      = 0
-	StatusBadKey  = 1
-	StatusNoRoom  = 2 // 配对码对应的 agent 不在线
-	StatusBusy    = 3 // 已有观看端
-	StatusHubErr  = 4 // hub 内部错误(等 agent 会话连接超时等)
+	// 端到端认证 (agent↔viewer, hub 只转发不参与)
+	ChAuthChallenge = 0x20 // agent→viewer, payload=16B 随机 nonce
+	ChAuthResponse  = 0x21 // viewer→agent, payload=u8 kind(0=配对码 1=设备令牌) + 32B HMAC
+	ChAuthResult    = 0x22 // agent→viewer, payload=u8 状态 + (配对成功时)64B 新设备令牌(hex)
+	ChDeviceInfo    = 0x23 // agent→viewer, payload=UTF-8 被投屏手机的型号, 供列表显示
 
+	// 握手响应状态码
+	StatusOK     = 0
+	StatusBadKey = 1
+	StatusNoRoom = 2 // 设备名对应的 agent 不在线
+	StatusBusy   = 3 // 已有观看端
+	StatusHubErr = 4 // hub 内部错误(等 agent 会话连接超时等)
+	StatusAuth   = 5 // 配对码/设备令牌不对
+
+	NonceLen    = 16
+	TokenLen    = 32 // 设备令牌原始字节数, 上线传 hex (64 字符)
 	MaxFrameLen = 8 << 20
 )
 
 var (
-	MagicViewer  = [4]byte{'P', 'C', 'V', '2'}
-	MagicAgent   = [4]byte{'P', 'C', 'A', '2'}
-	MagicSession = [4]byte{'P', 'C', 'S', '2'}
+	MagicViewer  = [4]byte{'P', 'C', 'V', '3'}
+	MagicAgent   = [4]byte{'P', 'C', 'A', '3'}
+	MagicSession = [4]byte{'P', 'C', 'S', '3'}
 )
+
+// AuthProof = HMAC-SHA256(secret, nonce)。配对码/设备令牌本身永不上线,
+// 因此中继(hub)与链路窃听者都拿不到可复用的凭据; nonce 每次随机, 防重放。
+func AuthProof(secret string, nonce []byte) []byte {
+	m := hmac.New(sha256.New, []byte(secret))
+	m.Write(nonce)
+	return m.Sum(nil)
+}
+
+func AuthProofValid(secret string, nonce, got []byte) bool {
+	return hmac.Equal(AuthProof(secret, nonce), got)
+}
 
 // FrameWriter 串行化多 goroutine 的帧写入(video/audio 并发下行)。
 type FrameWriter struct {

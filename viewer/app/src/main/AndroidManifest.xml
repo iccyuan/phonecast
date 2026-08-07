@@ -5,7 +5,8 @@
 
     <application
         android:label="PhoneCast"
-        android:theme="@android:style/Theme.Material.NoActionBar">
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@style/AppTheme">
 
         <activity
             android:name=".MainActivity"
@@ -24,12 +25,16 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".AddActivity"
+            android:exported="false" />
+
         <!-- 手机A 旋转时视频尺寸会变, 由解码器 format change 处理, 本机旋转不重建 Activity -->
         <activity
             android:name=".PlayerActivity"
             android:exported="false"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
-            android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen" />
+            android:theme="@style/PlayerTheme" />
     </application>
 
 </manifest>

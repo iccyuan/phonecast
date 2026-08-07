@@ -38,6 +38,14 @@ func (e *engine) State() (bool, string) {
 	return e.running, e.state
 }
 
+// refreshState: 配对码等信息变化时重发一次当前状态, 触发托盘刷新。
+func (e *engine) refreshState() {
+	running, s := e.State()
+	if running {
+		e.setState(s)
+	}
+}
+
 func (e *engine) setState(s string) {
 	e.mu.Lock()
 	e.state = s
@@ -117,7 +125,7 @@ func (e *engine) run(ctx context.Context) {
 	if *hubAddr != "" {
 		go e.hubLoop(ctx)
 	}
-	e.setState("运行中 · 配对码 " + *room)
+	e.setState("运行中 · 设备名 " + *room)
 }
 
 // waitForDevice: 没插手机时等待; 多台设备自动选第一台。返回 false 表示被 Stop 打断。
@@ -134,13 +142,16 @@ func (e *engine) waitForDevice(ctx context.Context) bool {
 		ready, unauthorized := parseAdbDevices(out)
 		if *serial != "" {
 			if slices.Contains(ready, *serial) {
+				rememberDevice(e.adb, *serial)
 				return true
 			}
+			// 配置里指定的手机不在场: 等它, 不要擅自换一台
 		} else if len(ready) > 0 {
 			if len(ready) > 1 {
-				log.Printf("检测到 %d 台设备, 使用第一台: %s (可在配置里用 serial 指定)", len(ready), ready[0])
+				log.Printf("检测到 %d 台手机, 先用第一台 (托盘菜单「选择被投屏手机」可切换)", len(ready))
 			}
 			*serial = ready[0]
+			rememberDevice(e.adb, *serial)
 			return true
 		}
 		if !waiting {
@@ -190,15 +201,12 @@ func (e *engine) handleDirectViewer(conn net.Conn) {
 	if _, err := io.ReadFull(conn, magic[:]); err != nil || magic != MagicViewer {
 		return
 	}
-	gotKey, err1 := ReadLenPrefixed(conn)
-	gotRoom, err2 := ReadLenPrefixed(conn)
-	if err1 != nil || err2 != nil {
+	gotRoom, err := ReadLenPrefixed(conn)
+	if err != nil {
 		return
 	}
-	if gotKey != *key || gotRoom != *room {
-		log.Printf("[直连] %s 密钥/配对码错误, 拒绝", conn.RemoteAddr())
-		time.Sleep(time.Second)
-		conn.Write([]byte{StatusBadKey})
+	if gotRoom != *room { // 设备名只是路由标识, 真正的门在下面的配对码认证
+		conn.Write([]byte{StatusNoRoom})
 		return
 	}
 	if !sessionMu.TryLock() {
@@ -209,6 +217,10 @@ func (e *engine) handleDirectViewer(conn net.Conn) {
 
 	conn.SetReadDeadline(time.Time{})
 	conn.Write([]byte{StatusOK})
+	if !authenticate(conn) {
+		log.Printf("[直连] %s 认证失败, 断开", conn.RemoteAddr())
+		return
+	}
 	log.Printf("[直连] 观看端 %s 接入", conn.RemoteAddr())
 	e.runWatched(conn)
 }
@@ -255,7 +267,7 @@ func (e *engine) hubRegister() error {
 	if status == StatusBadKey {
 		return errBadKey
 	}
-	log.Printf("[中继] 已注册到 hub %s, 配对码: %s", *hubAddr, *room)
+	log.Printf("[中继] 已注册到 hub %s, 设备名: %s", *hubAddr, *room)
 
 	fw := NewFrameWriter(conn)
 	for {
@@ -292,22 +304,51 @@ func (e *engine) hubSession(sessionID []byte) {
 		return
 	}
 	log.Printf("[中继] 会话开始 (id=%x)", sessionID[:4])
-	e.runWatched(conn)
+	if authenticate(conn) {
+		e.runWatched(conn)
+	} else {
+		log.Printf("[中继] 认证失败, 断开 (id=%x)", sessionID[:4])
+	}
 	log.Printf("[中继] 会话结束 (id=%x)", sessionID[:4])
+}
+
+// rememberDevice: 记下当前被投屏手机的机型, 供手机端列表显示与托盘状态。
+func rememberDevice(adb, serial string) {
+	for _, d := range listAdbDevices(adb) {
+		if d.Serial == serial {
+			setCurrentDeviceLabel(d.Label())
+			return
+		}
+	}
+	setCurrentDeviceLabel(serial)
+}
+
+// SwitchDevice: 切换被投屏手机 (托盘菜单), 会重启会话并写回配置。
+func (e *engine) SwitchDevice(serialID string) {
+	*serial = serialID
+	if loadedCfg != nil {
+		loadedCfg.Serial = serialID
+		saveConfig(configPath(), loadedCfg)
+	}
+	rememberDevice(e.adb, serialID)
+	log.Printf("[设备] 切换到 %s (%s)", deviceLabel(), serialID)
+	e.Restart()
 }
 
 // runWatched: 包一层状态提示的 runSession。
 // scrcpy-server (cleanup=true) 启动后会删掉自己的 jar, 所以每次会话前必须重新 push,
 // 否则第二次会话 app_process 因 CLASSPATH 失效直接 Abort。
 func (e *engine) runWatched(conn net.Conn) {
-	e.setState("投屏中 · 配对码 " + *room)
+	e.setState("投屏中 · 设备名 " + *room)
 	if out, err := adbRun(e.adb, "push", e.jar, remoteJarPath); err != nil {
 		log.Printf("会话前 adb push 失败: %v\n%s", err, out)
-		e.setState("运行中 · 配对码 " + *room)
+		e.setState("运行中 · 设备名 " + *room)
 		return
 	}
+	// 告诉手机端"你正在看哪台手机", 列表里显示真实机型而不是设备名
+	NewFrameWriter(conn).WriteFrame(ChDeviceInfo, []byte(deviceLabel()))
 	runSession(e.adb, conn)
 	if running, _ := e.State(); running {
-		e.setState("运行中 · 配对码 " + *room)
+		e.setState("运行中 · 设备名 " + *room)
 	}
 }

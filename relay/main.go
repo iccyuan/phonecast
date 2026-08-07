@@ -71,6 +71,7 @@ func main() {
 	}
 
 	eng := newEngine(resolveAdb(), resolveJar())
+	initAuth(loadedCfg.Devices, func() { eng.refreshState() })
 	runTray(eng) // 阻塞直到菜单点「退出」
 }
 
@@ -103,22 +104,29 @@ func banner() {
 	if *listen != "" {
 		lines = append(lines, fmt.Sprintf("  地址   %s%s  (局域网直连)", firstLanIP(), *listen))
 	}
-	lines = append(lines, "  密钥   "+*key, "  配对码 "+*room)
+	lines = append(lines, "  设备名 "+*room, "  配对码 "+pairCode()+" (6 位数字, 首次配对用)")
 	for _, l := range lines {
 		log.Print(l)
 	}
 }
 
 // connInfoText: 托盘「复制连接信息」的剪贴板内容。
+// 第一行给出 phonecast:// 链接 —— 把这段文本发到手机后点链接即可直接连,
+// 比照着念地址/配对码省事 (电脑与手机的剪贴板并不互通)。
 func connInfoText() string {
 	var b strings.Builder
+	primary := *hubAddr
+	if primary == "" {
+		primary = firstLanIP() + *listen
+	}
+	fmt.Fprintf(&b, "PhoneCast 连接链接(手机上点开即连):\r\n%s\r\n\r\n", pairURI(primary))
 	if *hubAddr != "" {
 		fmt.Fprintf(&b, "地址: %s\r\n", *hubAddr)
 	}
 	if *listen != "" {
 		fmt.Fprintf(&b, "地址(局域网): %s%s\r\n", firstLanIP(), *listen)
 	}
-	fmt.Fprintf(&b, "密钥: %s\r\n配对码: %s\r\n", *key, *room)
+	fmt.Fprintf(&b, "设备名: %s\r\n配对码: %s\r\n", *room, pairCode())
 	return b.String()
 }
 
@@ -345,6 +353,14 @@ func adbBaseArgs() []string {
 
 func adbRun(adb string, args ...string) (string, error) {
 	cmd := exec.Command(adb, append(adbBaseArgs(), args...)...)
+	hideWindow(cmd)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// adbRunNoSerial: 不带 -s 的 adb 调用 (枚举设备时用)。
+func adbRunNoSerial(adb string, args ...string) (string, error) {
+	cmd := exec.Command(adb, args...)
 	hideWindow(cmd)
 	out, err := cmd.CombinedOutput()
 	return string(out), err

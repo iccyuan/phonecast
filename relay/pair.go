@@ -13,10 +13,12 @@ import (
 	qrcode "github.com/skip2/go-qrcode"
 )
 
+// pairURI: 二维码内容。带的是短期配对码而非长期密钥 —— 即使二维码被拍到,
+// 也只在有效期内、且配对码尚未被用错 5 次时可用, 且可在托盘一键作废。
 func pairURI(addr string) string {
 	return "phonecast://c?a=" + url.QueryEscape(addr) +
-		"&k=" + url.QueryEscape(*key) +
-		"&r=" + url.QueryEscape(*room)
+		"&r=" + url.QueryEscape(*room) +
+		"&c=" + url.QueryEscape(pairCode())
 }
 
 // showPairPage 生成并打开配对页, 返回错误供托盘提示。
@@ -34,19 +36,20 @@ func showPairPage() error {
 	}
 
 	page := `<!doctype html><meta charset=utf-8><title>PhoneCast 配对</title>
-<style>body{font-family:system-ui;background:#111;color:#ddd;display:flex;flex-wrap:wrap;gap:2em;justify-content:center;padding:2em}
-.card{background:#1b1b1b;border-radius:12px;padding:1.5em;text-align:center;max-width:320px}
-img{width:260px;height:260px;border-radius:8px}h2{font-size:1em;color:#8ab}
-p{font-size:.85em;color:#999;word-break:break-all}b{color:#ddd}</style>`
+<style>body{font-family:system-ui;background:#10131a;color:#e6e9f0;display:flex;flex-wrap:wrap;gap:2em;justify-content:center;padding:2em}
+.card{background:#1a1e27;border-radius:16px;padding:1.5em;text-align:center;max-width:320px}
+img{width:260px;height:260px;border-radius:12px}h2{font-size:1em;color:#2d7dff}
+p{font-size:.85em;color:#8a93a6;word-break:break-all;line-height:1.7}b{color:#e6e9f0;font-size:1.05em}</style>`
 	for _, en := range entries {
 		png, err := qrcode.Encode(pairURI(en.addr), qrcode.Medium, 520)
 		if err != nil {
 			return err
 		}
 		page += fmt.Sprintf(`<div class=card><h2>%s</h2><img src="data:image/png;base64,%s">
-<p>手机B 用相机或扫码 App 扫码, 自动打开 PhoneCast 连接。<br>手动填写: 地址 <b>%s</b><br>密钥 <b>%s</b> · 配对码 <b>%s</b></p></div>`,
+<p>手机B 用相机或扫码 App 扫码, 自动打开 PhoneCast 连接。<br>
+手动填写: 地址 <b>%s</b><br>设备名 <b>%s</b> · 配对码 <b>%s</b></p></div>`,
 			html.EscapeString(en.title), base64.StdEncoding.EncodeToString(png),
-			html.EscapeString(en.addr), html.EscapeString(*key), html.EscapeString(*room))
+			html.EscapeString(en.addr), html.EscapeString(*room), html.EscapeString(pairCode()))
 	}
 
 	path := filepath.Join(os.TempDir(), "phonecast-pair.html")

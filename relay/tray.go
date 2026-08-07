@@ -6,9 +6,13 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"fyne.io/systray"
 )
+
+// 托盘子菜单里最多列出的手机数 (systray 菜单项不能动态增删, 预留固定槽位)
+const maxDeviceSlots = 6
 
 //go:embed icon.ico
 var iconData []byte
@@ -28,8 +32,12 @@ func trayReady(e *engine) {
 	mStop := systray.AddMenuItem("停止", "")
 	mRestart := systray.AddMenuItem("重新运行", "改配置后用这个生效")
 	systray.AddSeparator()
-	mPair := systray.AddMenuItem("显示配对二维码", "手机B 扫码即连")
-	mCopy := systray.AddMenuItem("复制手机端连接信息", "地址/密钥/配对码")
+	mCode := systray.AddMenuItem("配对码: ------", "手机首次连接时输入")
+	mCode.Disable()
+	mPair := systray.AddMenuItem("显示配对二维码", "手机B 扫码即连, 无需手输")
+	mNewCode := systray.AddMenuItem("重新生成配对码", "作废旧码")
+	mForget := systray.AddMenuItem("撤销已配对手机", "让所有手机重新配对")
+	mCopy := systray.AddMenuItem("复制手机端连接信息", "地址/设备名/配对码")
 	mConfig := systray.AddMenuItem("打开配置文件", "保存后点「重新运行」生效")
 	mLog := systray.AddMenuItem("查看日志", "")
 	var mHub *systray.MenuItem
@@ -37,12 +45,21 @@ func trayReady(e *engine) {
 		mHub = systray.AddMenuItem("打开 hub 状态页", url)
 	}
 	systray.AddSeparator()
+	mDevices := systray.AddMenuItem("选择被投屏手机", "一台电脑插多台手机时在这里切换")
+	deviceSlots := make([]*systray.MenuItem, maxDeviceSlots)
+	for i := range deviceSlots {
+		deviceSlots[i] = mDevices.AddSubMenuItem("", "")
+		deviceSlots[i].Hide()
+	}
+	systray.AddSeparator()
+	mUpdate := systray.AddMenuItem("检查更新", "当前 v"+appVersion)
 	mQuit := systray.AddMenuItem("退出", "")
 
 	e.onState = func() {
 		running, s := e.State()
 		mState.SetTitle("状态: " + s)
 		systray.SetTooltip("PhoneCast · " + s)
+		mCode.SetTitle(fmt.Sprintf("配对码: %s   (已配对 %d 台)", pairCode(), deviceCount()))
 		if running {
 			mStart.Disable()
 			mStop.Enable()
@@ -55,9 +72,52 @@ func trayReady(e *engine) {
 	}
 	e.Start()
 
+	// 设备列表随插拔变化, 定期刷新子菜单
+	serials := make([]string, maxDeviceSlots)
+	refreshDevices := func() {
+		list := readyDevices(e.adb)
+		for i, slot := range deviceSlots {
+			if i < len(list) {
+				d := list[i]
+				serials[i] = d.Serial
+				mark := "   "
+				if d.Serial == *serial {
+					mark = "✓ "
+				}
+				slot.SetTitle(mark + d.Label() + "  (" + d.Serial + ")")
+				slot.Show()
+			} else {
+				serials[i] = ""
+				slot.Hide()
+			}
+		}
+	}
+	refreshDevices()
+	go func() {
+		t := time.NewTicker(20 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			refreshDevices()
+		}
+	}()
+	go checkUpdate(false) // 启动时静默检查, 有新版才打扰
+
+	for i, slot := range deviceSlots {
+		go func(i int, slot *systray.MenuItem) {
+			for range slot.ClickedCh {
+				if s := serials[i]; s != "" && s != *serial {
+					e.SwitchDevice(s)
+					refreshDevices()
+				}
+			}
+		}(i, slot)
+	}
+
 	go func() {
 		for {
 			select {
+			case <-mUpdate.ClickedCh:
+				go checkUpdate(true)
 			case <-mStart.ClickedCh:
 				e.Start()
 			case <-mStop.ClickedCh:
@@ -65,8 +125,23 @@ func trayReady(e *engine) {
 			case <-mRestart.ClickedCh:
 				go e.Restart()
 			case <-mPair.ClickedCh:
+				if !pairCodeValid() {
+					rotatePairCode() // 过期了先换新码再展示
+				}
 				if err := showPairPage(); err != nil {
 					alertf("生成配对页失败: %v", err)
+				}
+			case <-mNewCode.ClickedCh:
+				code := rotatePairCode()
+				if !hasConsole {
+					messageBox("PhoneCast", "新配对码: "+code+
+						"\n\n旧配对码已作废。已配对过的手机不受影响。", mbOK|mbIconInfo)
+				}
+			case <-mForget.ClickedCh:
+				if hasConsole || messageBox("PhoneCast",
+					"撤销后所有手机都需要用新配对码重新配对, 继续?",
+					mbOKCancel|mbIconWarning) == idOK {
+					forgetDevices()
 				}
 			case <-mCopy.ClickedCh:
 				if err := setClipboard(connInfoText()); err == nil {
@@ -119,5 +194,10 @@ func alertOnceCopied() {
 		return
 	}
 	copyNoticeShown = true
-	messageBox("PhoneCast", "已复制到剪贴板:\n\n"+strings.ReplaceAll(connInfoText(), "\r\n", "\n"), mbOK|mbIconInfo)
+	messageBox("PhoneCast",
+		"已复制到【电脑】剪贴板:\n\n"+strings.ReplaceAll(connInfoText(), "\r\n", "\n")+
+			"\n注意: 电脑剪贴板不会同步到手机。\n"+
+			"请把这段文字发到手机(微信/QQ 等), 在手机上点开链接即可直接连接。\n"+
+			"更省事的做法: 用「显示配对二维码」直接扫码。",
+		mbOK|mbIconInfo)
 }

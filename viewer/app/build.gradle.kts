@@ -1,7 +1,25 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+
+/**
+ * 签名配置来源: 环境变量(CI) 优先, 其次 local.properties(本机)。
+ * 二者都不入库 —— 但两边必须是同一个 keystore, 否则新版 APK 签名不一致会装不上去,
+ * 应用内自动更新就会失败。
+ */
+val signingProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+
+fun signingValue(name: String): String? =
+    System.getenv(name)?.takeIf { it.isNotBlank() }
+        ?: signingProps.getProperty(name)?.takeIf { it.isNotBlank() }
+
+val keystoreFile = signingValue("SIGNING_STORE_FILE")?.let { file(it) }?.takeIf { it.exists() }
 
 android {
     namespace = "com.phonecast.viewer"
@@ -11,13 +29,38 @@ android {
         applicationId = "com.phonecast.viewer"
         minSdk = 24
         targetSdk = 34
-        versionCode = 6
-        versionName = "0.6.0"
+        versionCode = 7
+        versionName = "0.7.0"
+    }
+
+    signingConfigs {
+        if (keystoreFile != null) {
+            create("release") {
+                storeFile = keystoreFile
+                storePassword = signingValue("SIGNING_STORE_PASSWORD")
+                keyAlias = signingValue("SIGNING_KEY_ALIAS")
+                keyPassword = signingValue("SIGNING_KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            // 没配 keystore 时不签名(构建仍能过), 但产物不可用于覆盖安装
+            signingConfig = signingConfigs.findByName("release")
+        }
+        debug {
+            // 本机 debug 也用正式签名: 这样 adb 装的包和 Release 产物能互相覆盖升级
+            signingConfigs.findByName("release")?.let { signingConfig = it }
+        }
+    }
+
+    // 打包出 app-release.apk / app-debug.apk 之外再给一个稳定名字, 方便 CI 取
+    applicationVariants.all {
+        outputs.all {
+            (this as com.android.build.gradle.internal.api.BaseVariantOutputImpl)
+                .outputFileName = "phonecast-viewer-$name.apk"
         }
     }
     compileOptions {

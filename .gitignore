@@ -8,3 +8,5 @@ viewer/.idea/
 *.exe~
 phonecast.json
 *.log
+*.jks
+*.keystore

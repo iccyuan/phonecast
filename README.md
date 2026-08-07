@@ -33,7 +33,29 @@
 
 装 `phonecast-viewer.apk`。主页是**已配对手机列表**(显示真实机型),点条目直接连;右下角「+」手动添加(地址 / 设备名 / 6 位配对码)。最省事的是扫电脑托盘里的**配对二维码**,自动完成配对并连接。无 WiFi 也可 USB 直连电脑:`adb reverse tcp:27184 tcp:27184` 后地址填 `127.0.0.1:27184`。
 
-两端都支持在线更新:电脑端托盘「检查更新」可自动下载替换并重启;App 内「检查更新」会引导下载新 APK。
+两端都支持在线更新:电脑端托盘「检查更新」自动下载、替换并重启;App 在「+」菜单里「检查更新」,**应用内下载完直接拉起系统安装器**(首次需在系统里允许 PhoneCast 安装应用,会自动引导)。
+
+## 签名
+
+应用内更新要求新旧 APK **签名一致**,否则系统拒绝覆盖安装。因此 debug 与 release 都使用同一个正式 keystore:
+
+- 本机:在 `viewer/local.properties` 配置(该文件已 gitignore)
+  ```properties
+  SIGNING_STORE_FILE=D:/keys/phonecast.jks
+  SIGNING_STORE_PASSWORD=...
+  SIGNING_KEY_ALIAS=phonecast
+  SIGNING_KEY_PASSWORD=...
+  ```
+- CI:仓库 Secrets 配 `SIGNING_KEYSTORE_B64`(keystore 的 base64)、`SIGNING_STORE_PASSWORD`、`SIGNING_KEY_ALIAS`、`SIGNING_KEY_PASSWORD`。未配置时工作流会退化为 debug 签名并给出告警——那样的产物无法覆盖升级正式版。
+
+新建 keystore:
+
+```powershell
+keytool -genkeypair -v -keystore phonecast.jks -alias phonecast `
+  -keyalg RSA -keysize 4096 -validity 10950 -dname "CN=PhoneCast, O=..., C=CN"
+```
+
+**keystore 必须备份**:丢失后无法再向已安装用户推送更新。
 
 ### 云端 hub
 

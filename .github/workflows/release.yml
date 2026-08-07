@@ -41,12 +41,39 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # 签名必须每次一致, 否则应用内更新会因签名不符而拒绝安装。
+      # keystore 以 base64 存在仓库 Secrets 里 (SIGNING_KEYSTORE_B64), 不入库。
+      - name: Prepare signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$GITHUB_WORKSPACE/viewer/release.jks"
+            echo "SIGNED=1" >> "$GITHUB_ENV"
+          else
+            echo "::warning::未配置 SIGNING_KEYSTORE_B64, 将产出 debug 签名包(无法覆盖升级正式版)"
+          fi
+
       - name: Build viewer APK
         working-directory: viewer
+        env:
+          SIGNING_STORE_FILE: ${{ github.workspace }}/viewer/release.jks
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
           chmod +x gradlew
-          ./gradlew :app:assembleDebug --no-daemon
-          cp app/build/outputs/apk/debug/app-debug.apk ../dist/phonecast-viewer.apk
+          if [ "$SIGNED" = "1" ]; then
+            ./gradlew :app:assembleRelease --no-daemon
+            cp app/build/outputs/apk/release/phonecast-viewer-release.apk ../dist/phonecast-viewer.apk
+          else
+            ./gradlew :app:assembleDebug --no-daemon
+            cp app/build/outputs/apk/debug/phonecast-viewer-debug.apk ../dist/phonecast-viewer.apk
+          fi
+
+      - name: Clean up signing key
+        if: always()
+        run: rm -f "$GITHUB_WORKSPACE/viewer/release.jks"
 
       - name: Create release
         uses: softprops/action-gh-release@v2

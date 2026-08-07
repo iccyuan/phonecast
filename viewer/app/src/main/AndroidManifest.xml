@@ -3,6 +3,8 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- 应用内下载新版后直接拉起安装 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
@@ -30,6 +32,13 @@
         <activity
             android:name=".AddActivity"
             android:exported="false" />
+
+        <!-- 把下载好的 APK 交给系统安装器 (Android 7+ 不接受 file:// ) -->
+        <provider
+            android:name=".UpdateProvider"
+            android:authorities="com.phonecast.viewer.updates"
+            android:exported="false"
+            android:grantUriPermissions="true" />
 
         <activity
             android:name=".ScanActivity"

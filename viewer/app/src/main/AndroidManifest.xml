@@ -2,6 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
         android:label="PhoneCast"
@@ -28,6 +30,11 @@
         <activity
             android:name=".AddActivity"
             android:exported="false" />
+
+        <activity
+            android:name=".ScanActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
 
         <!-- 手机A 旋转时视频尺寸会变, 由解码器 format change 处理, 本机旋转不重建 Activity -->
         <activity

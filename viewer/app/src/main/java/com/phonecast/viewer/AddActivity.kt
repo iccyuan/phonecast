@@ -14,6 +14,10 @@ import android.widget.Toast
 /** 添加电脑: 填 地址/设备名/配对码, 或粘贴电脑端复制的连接信息。 */
 class AddActivity : Activity() {
 
+    private companion object {
+        const val REQ_SCAN = 1
+    }
+
     private lateinit var addrInput: EditText
     private lateinit var roomInput: EditText
     private lateinit var codeInput: EditText
@@ -34,7 +38,8 @@ class AddActivity : Activity() {
         }
 
         val connectBtn = Ui.primaryButton(c, "配对并投屏")
-        val pasteBtn = Ui.flatButton(c, "粘贴本机剪贴板内容")
+        val scanBtn = Ui.flatButton(c, "改用扫码")
+        val pasteBtn = Ui.flatButton(c, "粘贴本机剪贴板内容", Ui.MUTED)
 
         val card = Ui.card(c).apply {
             addView(Ui.label(c, "地址"))
@@ -47,10 +52,13 @@ class AddActivity : Activity() {
                 LinearLayout.LayoutParams.MATCH_PARENT, Ui.dp(c, 50)).apply {
                 topMargin = Ui.dp(c, 22)
             })
-            addView(pasteBtn, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, Ui.dp(c, 42)).apply {
-                topMargin = Ui.dp(c, 4)
-            })
+            addView(LinearLayout(c).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(scanBtn, LinearLayout.LayoutParams(0, Ui.dp(c, 42), 1f))
+                addView(pasteBtn, LinearLayout.LayoutParams(0, Ui.dp(c, 42), 1f))
+            }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(c, 6) })
         }
 
         val root = LinearLayout(c).apply {
@@ -58,18 +66,14 @@ class AddActivity : Activity() {
             setBackgroundColor(Ui.BG)
             val pad = Ui.dp(c, 22)
             setPadding(pad, Ui.dp(c, 48), pad, pad)
-            addView(Ui.flatButton(c, "‹  返回").apply {
-                setPadding(0, 0, 0, 0)
-                setOnClickListener { finish() }
-            }, LinearLayout.LayoutParams(Ui.dp(c, 96), Ui.dp(c, 40)).apply {
-                bottomMargin = Ui.dp(c, 12)
+            addView(Ui.toolbar(c, "手动添加") { finish() })
+            addView(Ui.subtitle(c, "三项都能在电脑托盘菜单里看到").apply {
+                setPadding(Ui.dp(c, 4), Ui.dp(c, 6), 0, 0)
             })
-            addView(Ui.title(c, "添加电脑"))
-            addView(Ui.subtitle(c, "以上三项在电脑托盘菜单里可以看到"))
             addView(card, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(c, 24) })
-            addView(Ui.hint(c, "更省事: 电脑托盘右键 →「显示配对二维码」,\n用相机扫一下即可自动完成配对"),
+            addView(Ui.hint(c, "更省事: 电脑托盘右键 →「显示配对二维码」,\n用上面的「改用扫码」扫一下即可"),
                 LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT,
                     LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(c, 24) })
@@ -83,6 +87,20 @@ class AddActivity : Activity() {
 
         connectBtn.setOnClickListener { submit() }
         pasteBtn.setOnClickListener { pasteFromClipboard() }
+        scanBtn.setOnClickListener {
+            startActivityForResult(Intent(c, ScanActivity::class.java), REQ_SCAN)
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        val uri = data?.data ?: return
+        if (requestCode == REQ_SCAN && resultCode == RESULT_OK) {
+            uri.getQueryParameter("a")?.let { addrInput.setText(it) }
+            uri.getQueryParameter("r")?.let { roomInput.setText(it) }
+            uri.getQueryParameter("c")?.let { codeInput.setText(it) }
+            submit() // 扫到就直接连
+        }
     }
 
     private fun submit() {

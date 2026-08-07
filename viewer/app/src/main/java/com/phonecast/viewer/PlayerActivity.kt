@@ -12,6 +12,7 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.View
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -56,10 +57,14 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
             holder.addCallback(this@PlayerActivity)
             setOnTouchListener { v, ev -> handleTouch(v.width, v.height, ev); true }
         }
+        // 连接过程中的状态提示: 药丸形底衬, 出画面后隐藏
         statusText = TextView(this).apply {
-            text = "正在连接..."
-            setTextColor(Ui.MUTED)
-            textSize = 14f
+            text = "正在连接…"
+            setTextColor(Ui.TEXT)
+            textSize = 13.5f
+            background = Ui.rounded(this@PlayerActivity, Ui.SURFACE, 20, Ui.BORDER)
+            val ph = Ui.dp(this@PlayerActivity, 18)
+            setPadding(ph, Ui.dp(this@PlayerActivity, 10), ph, Ui.dp(this@PlayerActivity, 10))
         }
         container = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -69,31 +74,13 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
                 FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
         }
 
-        val navBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(0xFF161A22.toInt())
-            // 前三个键发给【被投屏的手机】, 最后一个是退出本次投屏(本机)
-            for ((label, code) in listOf(
-                "‹  返回" to ControlMessages.KEYCODE_BACK,
-                "主页" to ControlMessages.KEYCODE_HOME,
-                "多任务" to ControlMessages.KEYCODE_APP_SWITCH,
-            )) {
-                addView(Ui.flatButton(context, label, Ui.TEXT).apply {
-                    setOnClickListener { ControlMessages.keyPress(code).forEach(client::send) }
-                }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
-            }
-            addView(Ui.flatButton(context, "✕ 断开", Ui.MUTED).apply {
-                setOnClickListener { finish() }
-            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
-        }
-
         setContentView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.BLACK)
             addView(container, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
-            addView(navBar, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, Ui.dp(context, 52)))
+            addView(navBar(), LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, Ui.dp(context, 62)))
         })
 
         addr = intent.getStringExtra("addr") ?: ""
@@ -103,6 +90,57 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
             room, intent.getStringExtra("code") ?: "", Tokens.get(this, addr, room), this)
         client.start()
         thread(name = "decoder-input") { runDecoder() }
+    }
+
+    /**
+     * 底部操作栏: 左侧三个键发给【被投屏的手机】, 用竖线分隔后右侧是退出本次投屏(本机)。
+     * 图标 + 小字标签, 既像系统导航条又能说清各自作用。
+     */
+    private fun navBar(): LinearLayout {
+        val c = this
+        fun item(icon: android.graphics.drawable.Drawable, label: String, tint: Int, onClick: () -> Unit) =
+            LinearLayout(c).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                background = Ui.rowBackground(c)
+                setOnClickListener { onClick() }
+                addView(View(c).apply { background = icon },
+                    LinearLayout.LayoutParams(Ui.dp(c, 22), Ui.dp(c, 22)))
+                addView(TextView(c).apply {
+                    text = label
+                    setTextColor(tint)
+                    textSize = 10f
+                    setPadding(0, Ui.dp(c, 3), 0, 0)
+                })
+            }
+
+        return LinearLayout(c).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(Ui.SURFACE)
+            val pad = Ui.dp(c, 6)
+            setPadding(pad, pad, pad, pad)
+
+            addView(item(Icons.NavBack(), "返回", Ui.MUTED) {
+                ControlMessages.keyPress(ControlMessages.KEYCODE_BACK).forEach(client::send)
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
+            addView(item(Icons.NavHome(c), "主页", Ui.MUTED) {
+                ControlMessages.keyPress(ControlMessages.KEYCODE_HOME).forEach(client::send)
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
+            addView(item(Icons.NavRecents(c), "多任务", Ui.MUTED) {
+                ControlMessages.keyPress(ControlMessages.KEYCODE_APP_SWITCH).forEach(client::send)
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
+
+            // 分隔线: 左边控制远端, 右边作用于本机
+            addView(View(c).apply { setBackgroundColor(Ui.BORDER) },
+                LinearLayout.LayoutParams(Ui.dp(c, 1), Ui.dp(c, 26)).apply {
+                    leftMargin = Ui.dp(c, 4)
+                    rightMargin = Ui.dp(c, 4)
+                })
+
+            addView(item(Icons.Close(c, Ui.DIM), "断开", Ui.DIM) { finish() },
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 0.9f))
+        }
     }
 
     // ---- StreamClient.Listener (非 UI 线程) ----
@@ -242,7 +280,7 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
         videoW = w
         videoH = h
         runOnUiThread {
-            statusText.text = ""
+            statusText.visibility = View.GONE // 画面已出, 收起提示
             fitSurface()
         }
     }

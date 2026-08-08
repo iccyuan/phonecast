@@ -15,6 +15,9 @@ import (
 // 不内置任何默认 hub 地址 (服务器信息不进代码库); 向导里留空即仅局域网直连。
 const defaultHub = ""
 
+// 局域网直连的默认监听地址; 托盘关闭直连时置空, 重新开启时恢复成它。
+const defaultListen = ":27184"
+
 type config struct {
 	Key     string `json:"key"`  // hub 接入密钥 (长, 只在配置文件里, 不用手输)
 	Room    string `json:"room"` // 设备名: 公开路由标识, 非密码
@@ -24,10 +27,12 @@ type config struct {
 	Listen  string `json:"listen"`
 	Serial  string `json:"serial,omitempty"`
 	Adb     string `json:"adb,omitempty"`
-	MaxSize int    `json:"max_size"`
-	BitRate int    `json:"bit_rate"`
-	MaxFps  int    `json:"max_fps"`
-	Audio   *bool  `json:"audio"`
+	MaxSize    int    `json:"max_size"`
+	BitRate    int    `json:"bit_rate"`
+	MaxFps     int    `json:"max_fps"`
+	Audio      *bool  `json:"audio"`
+	Resolution string `json:"resolution,omitempty"` // auto | original
+	VideoCodec string `json:"video_codec,omitempty"` // auto | h264
 }
 
 func configPath() string {
@@ -160,6 +165,8 @@ func applyConfig(cfg *config) {
 	}
 	setStr("key", key, cfg.Key)
 	setStr("room", room, cfg.Room)
+	setStr("resolution", resolution, cfg.Resolution)
+	setStr("video-codec", videoCodec, cfg.VideoCodec)
 	setStr("hub", hubAddr, cfg.Hub)
 	setStr("s", serial, cfg.Serial)
 	setStr("adb", adbPath, cfg.Adb)

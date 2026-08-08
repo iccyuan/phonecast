@@ -32,6 +32,12 @@ const (
 	ChAuthChallenge = 0x20 // agent→viewer, payload=16B 随机 nonce
 	ChAuthResponse  = 0x21 // viewer→agent, payload=u8 kind(0=配对码 1=设备令牌) + 32B HMAC
 	ChAuthResult    = 0x22 // agent→viewer, payload=u8 状态 + (配对成功时)64B 新设备令牌(hex)
+	ChDeviceInfo    = 0x23 // agent→viewer, payload=UTF-8 被投屏手机的型号, 供列表显示
+	ChLanAddrs      = 0x24 // agent→viewer, payload=当前局域网地址(逗号分隔), 供手机刷新直连路径
+
+	// 观看端能力/偏好 (viewer→agent), 认证后、开流前发一次
+	ChClientInfo   = 0x30 // payload="w=1080;h=2400;h265=1;audio=1" 形式的 UTF-8
+	ChAudioToggle  = 0x31 // payload=1 字节, 1=要音频 0=不要 (运行中可随时切)
 
 	// 握手响应状态码
 	StatusOK     = 0

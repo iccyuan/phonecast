@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -118,6 +119,7 @@ func (e *engine) run(ctx context.Context) {
 		go e.Stop()
 		return
 	}
+	go probeEncoders(e.adb) // 探一次: 这台手机能不能硬编 H.265
 	banner()
 	go checkFirewall() // 局域网连不上最常见的原因就是这条规则没加
 	if *listen != "" {
@@ -199,6 +201,9 @@ func (e *engine) handleDirectViewer(conn net.Conn) {
 	defer func() { e.untrack(conn); conn.Close() }()
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	peer := conn.RemoteAddr().String()
+	if !allowDirect(conn) { // 同网段校验 + 每 IP 失败冷却
+		return
+	}
 	log.Printf("[直连] 收到来自 %s 的连接", peer)
 
 	var magic [4]byte
@@ -230,11 +235,13 @@ func (e *engine) handleDirectViewer(conn net.Conn) {
 	conn.SetReadDeadline(time.Time{})
 	conn.Write([]byte{StatusOK})
 	if !authenticate(conn) {
-		log.Printf("[直连] %s 认证失败, 断开", conn.RemoteAddr())
+		directLimiter.fail(remoteHost(conn))
+		log.Printf("[直连] %s 认证失败, 断开", peer)
 		return
 	}
-	log.Printf("[直连] 观看端 %s 接入", conn.RemoteAddr())
-	e.runWatched(conn)
+	directLimiter.ok(remoteHost(conn))
+	log.Printf("[直连] 观看端 %s 接入", peer)
+	e.runWatched(conn, true) // 局域网直连: 带宽充裕, 可以给高画质
 }
 
 // ---- 中继模式 ----
@@ -317,7 +324,7 @@ func (e *engine) hubSession(sessionID []byte) {
 	}
 	log.Printf("[中继] 会话开始 (id=%x)", sessionID[:4])
 	if authenticate(conn) {
-		e.runWatched(conn)
+		e.runWatched(conn, false) // 经公网中继: 码率受配置上限约束
 	} else {
 		log.Printf("[中继] 认证失败, 断开 (id=%x)", sessionID[:4])
 	}
@@ -335,6 +342,22 @@ func rememberDevice(adb, serial string) {
 	setCurrentDeviceLabel(serial)
 }
 
+// SetLanDirect: 开关局域网直连监听 (托盘菜单), 写回配置并重启。
+// 在公用网络里想彻底消除本机暴露时用它 —— 关掉后只走中继。
+func (e *engine) SetLanDirect(on bool) {
+	if on {
+		*listen = defaultListen
+	} else {
+		*listen = ""
+	}
+	if loadedCfg != nil {
+		loadedCfg.Listen = *listen
+		saveConfig(configPath(), loadedCfg)
+	}
+	log.Printf("[设置] 局域网直连已%s", map[bool]string{true: "开启", false: "关闭"}[on])
+	e.Restart()
+}
+
 // SwitchDevice: 切换被投屏手机 (托盘菜单), 会重启会话并写回配置。
 func (e *engine) SwitchDevice(serialID string) {
 	*serial = serialID
@@ -350,16 +373,32 @@ func (e *engine) SwitchDevice(serialID string) {
 // runWatched: 包一层状态提示的 runSession。
 // scrcpy-server (cleanup=true) 启动后会删掉自己的 jar, 所以每次会话前必须重新 push,
 // 否则第二次会话 app_process 因 CLASSPATH 失效直接 Abort。
-func (e *engine) runWatched(conn net.Conn) {
+func (e *engine) runWatched(conn net.Conn, viaLan bool) {
 	e.setState("投屏中 · 设备名 " + *room)
 	if out, err := adbRun(e.adb, "push", e.jar, remoteJarPath); err != nil {
 		log.Printf("会话前 adb push 失败: %v\n%s", err, out)
 		e.setState("运行中 · 设备名 " + *room)
 		return
 	}
+	fw := NewFrameWriter(conn)
 	// 告诉手机端"你正在看哪台手机", 列表里显示真实机型而不是设备名
-	NewFrameWriter(conn).WriteFrame(ChDeviceInfo, []byte(deviceLabel()))
-	runSession(e.adb, conn)
+	fw.WriteFrame(ChDeviceInfo, []byte(deviceLabel()))
+	// 把当前局域网地址同步过去: 换了 WiFi 后手机存的旧 IP 会失效, 靠这个自愈 ——
+	// 即便这次是走中继连上的, 下次也能自动改走局域网。
+	if *listen != "" {
+		var lan []string
+		for _, ip := range lanIPs() {
+			lan = append(lan, ip+*listen)
+		}
+		if len(lan) > 0 {
+			fw.WriteFrame(ChLanAddrs, []byte(strings.Join(lan, ",")))
+		}
+	}
+
+	// 读观看端能力(屏幕尺寸/H.265/要不要音频), 决定这次会话怎么编码
+	audioMuted.Store(false)
+	info := readClientInfo(conn, func() (byte, []byte, error) { return ReadFrame(conn) })
+	runSession(e.adb, conn, info, viaLan)
 	if running, _ := e.State(); running {
 		e.setState("运行中 · 设备名 " + *room)
 	}

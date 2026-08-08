@@ -37,6 +37,7 @@ func trayReady(e *engine) {
 	mPair := systray.AddMenuItem("显示配对二维码", "手机B 扫码即连, 无需手输")
 	mNewCode := systray.AddMenuItem("重新生成配对码", "作废旧码")
 	mForget := systray.AddMenuItem("撤销已配对手机", "让所有手机重新配对")
+	mLan := systray.AddMenuItem("局域网直连", "关掉后只走中继, 本机不再监听(公共网络下更保险)")
 	mFirewall := systray.AddMenuItem("允许局域网访问", "添加 Windows 防火墙入站规则(需管理员确认)")
 	mCopy := systray.AddMenuItem("复制手机端连接信息", "地址/设备名/配对码")
 	mConfig := systray.AddMenuItem("打开配置文件", "保存后点「重新运行」生效")
@@ -61,6 +62,13 @@ func trayReady(e *engine) {
 		mState.SetTitle("状态: " + s)
 		systray.SetTooltip("PhoneCast · " + s)
 		mCode.SetTitle(fmt.Sprintf("配对码: %s   (已配对 %d 台)", pairCode(), deviceCount()))
+		if *listen != "" {
+			mLan.Check()
+			mFirewall.Show()
+		} else {
+			mLan.Uncheck()
+			mFirewall.Hide() // 没在监听时放行规则没有意义
+		}
 		if running {
 			mStart.Disable()
 			mStop.Enable()
@@ -144,6 +152,8 @@ func trayReady(e *engine) {
 					mbOKCancel|mbIconWarning) == idOK {
 					forgetDevices()
 				}
+			case <-mLan.ClickedCh:
+				go e.SetLanDirect(*listen == "") // 当前没监听就开启, 反之关闭
 			case <-mFirewall.ClickedCh:
 				go func() {
 					if firewallRuleExists() {

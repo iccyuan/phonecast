@@ -84,6 +84,20 @@ object Saved {
         save(c, items.map { if (it.room == room) it.copy(name = name) else it })
     }
 
+    /**
+     * 用电脑报来的当前局域网地址【替换】本地存的局域网地址(中继地址保留)。
+     * 换 WiFi 后旧 IP 会永远连不上, 留着只会让每次连接白等超时, 所以是替换不是追加。
+     */
+    fun updateLanAddrs(c: Context, room: String, lan: List<String>) {
+        if (lan.isEmpty()) return
+        val items = list(c)
+        val e = items.find { it.room == room } ?: return
+        val relay = e.addrs.filterNot { Entry.isLan(it) }
+        val next = Entry.order(lan + relay)
+        if (next == e.addrs) return
+        save(c, items.map { if (it.room == room) it.copy(addrs = next) else it })
+    }
+
     /** 连接成功的地址提到最前, 下次先试它 */
     fun promote(c: Context, room: String, addr: String) {
         val items = list(c)

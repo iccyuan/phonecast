@@ -382,6 +382,57 @@ object Icons {
         }
     }
 
+    /** 声音开: 喇叭 + 两道声波 */
+    class SoundOn(c: Context, color: Int = Color.WHITE) : Base(color) {
+        private val p = stroke(color, Ui.dpf(c, 2f))
+        private val fillP = fill(color)
+        private val path = Path()
+        override fun draw(canvas: Canvas) {
+            val b = bounds
+            val s = minOf(b.width(), b.height()) * 0.30f
+            val cx = b.exactCenterX() - s * 0.25f
+            val cy = b.exactCenterY()
+            path.reset()
+            path.moveTo(cx - s * 0.7f, cy - s * 0.35f)
+            path.lineTo(cx - s * 0.25f, cy - s * 0.35f)
+            path.lineTo(cx + s * 0.3f, cy - s)
+            path.lineTo(cx + s * 0.3f, cy + s)
+            path.lineTo(cx - s * 0.25f, cy + s * 0.35f)
+            path.lineTo(cx - s * 0.7f, cy + s * 0.35f)
+            path.close()
+            canvas.drawPath(path, fillP)
+            for (r in listOf(s * 0.75f, s * 1.15f)) {
+                canvas.drawArc(RectF(cx + s * 0.3f - r, cy - r, cx + s * 0.3f + r, cy + r),
+                    -55f, 110f, false, p)
+            }
+        }
+    }
+
+    /** 声音关: 喇叭 + 叉 */
+    class SoundOff(c: Context, color: Int = Color.WHITE) : Base(color) {
+        private val p = stroke(color, Ui.dpf(c, 2f))
+        private val fillP = fill(color)
+        private val path = Path()
+        override fun draw(canvas: Canvas) {
+            val b = bounds
+            val s = minOf(b.width(), b.height()) * 0.30f
+            val cx = b.exactCenterX() - s * 0.3f
+            val cy = b.exactCenterY()
+            path.reset()
+            path.moveTo(cx - s * 0.7f, cy - s * 0.35f)
+            path.lineTo(cx - s * 0.25f, cy - s * 0.35f)
+            path.lineTo(cx + s * 0.3f, cy - s)
+            path.lineTo(cx + s * 0.3f, cy + s)
+            path.lineTo(cx - s * 0.25f, cy + s * 0.35f)
+            path.lineTo(cx - s * 0.7f, cy + s * 0.35f)
+            path.close()
+            canvas.drawPath(path, fillP)
+            val x0 = cx + s * 0.7f
+            canvas.drawLine(x0, cy - s * 0.45f, x0 + s * 0.9f, cy + s * 0.45f, p)
+            canvas.drawLine(x0 + s * 0.9f, cy - s * 0.45f, x0, cy + s * 0.45f, p)
+        }
+    }
+
     /** 检查更新: 带箭头的环形 */
     class Refresh(c: Context, color: Int = Color.WHITE) : Base(color) {
         private val ring = stroke(color, Ui.dpf(c, 2f))

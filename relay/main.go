@@ -22,6 +22,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,7 +40,9 @@ var (
 	room      = flag.String("room", "", "配对码, 手机B 用它找到本机 (默认随机生成)")
 	localPort = flag.Int("local-port", 27183, "adb forward 用的本地端口")
 	serverJar = flag.String("server", "", "scrcpy-server 文件路径 (默认: exe 同目录下的 scrcpy-server-v2.7)")
-	maxSize   = flag.Int("max-size", 1440, "视频长边最大像素 (0=原始分辨率)")
+	maxSize   = flag.Int("max-size", 1440, "视频长边最大像素 (0=原始分辨率); 仅在观看端未上报屏幕尺寸时用")
+	resolution = flag.String("resolution", "auto", "分辨率策略: auto=按观看端屏幕自适应, original=被投屏手机原始分辨率")
+	videoCodec = flag.String("video-codec", "auto", "视频编码: auto=两端都支持就用 h265, 否则 h264; 也可强制 h264")
 	bitRate   = flag.Int("bit-rate", 8_000_000, "视频码率 bps (走公网中继建议 2000000-4000000)")
 	maxFps    = flag.Int("max-fps", 60, "最大帧率")
 	audio     = flag.Bool("audio", true, "转发音频 (手机A 需 Android 11+, AAC 128kbps)")
@@ -147,7 +150,7 @@ func parseAdbDevices(out string) (ready []string, unauthorized bool) {
 
 // runSession: 启动 scrcpy-server, 把三条 socket 桥接到 viewerConn 上的 v2 帧流。
 // 任一关键通路断开即整体清理; 音频通路失败只降级不拆会话。
-func runSession(adb string, viewerConn net.Conn) {
+func runSession(adb string, viewerConn net.Conn, info clientInfo, viaLan bool) {
 	scid := randomToken(4)
 	forwardSpec := fmt.Sprintf("tcp:%d", *localPort)
 	if out, err := adbRun(adb, "forward", forwardSpec, "localabstract:scrcpy_"+scid); err != nil {
@@ -156,13 +159,21 @@ func runSession(adb string, viewerConn net.Conn) {
 	}
 	defer adbRun(adb, "forward", "--remove", forwardSpec)
 
+	codec := pickCodec(info)
+	size := pickMaxSize(info)
+	rate := pickBitRate(size, codec, viaLan)
+	wantAudio := *audio && info.Audio
+	log.Printf("[编码] %s, 长边 %d(%s), %d kbps, 音频 %v, 路径 %s",
+		codec, size, *resolution, rate/1000, wantAudio,
+		map[bool]string{true: "局域网", false: "中继"}[viaLan])
+
 	args := append(adbBaseArgs(), "shell",
 		"CLASSPATH="+remoteJarPath, "app_process", "/", "com.genymobile.scrcpy.Server", serverVersion,
 		"scid="+scid, "log_level=info",
-		"video=true", "video_codec=h264",
-		fmt.Sprintf("audio=%v", *audio), "audio_codec=aac",
-		fmt.Sprintf("max_size=%d", *maxSize),
-		fmt.Sprintf("video_bit_rate=%d", *bitRate),
+		"video=true", "video_codec="+codec,
+		fmt.Sprintf("audio=%v", wantAudio), "audio_codec=aac",
+		fmt.Sprintf("max_size=%d", size),
+		fmt.Sprintf("video_bit_rate=%d", rate),
 		fmt.Sprintf("max_fps=%d", *maxFps),
 		"tunnel_forward=true", "control=true", "cleanup=true",
 		"send_device_meta=false", "send_dummy_byte=true",
@@ -202,7 +213,7 @@ func runSession(adb string, viewerConn net.Conn) {
 	defer videoConn.Close()
 
 	var audioConn net.Conn
-	if *audio {
+	if wantAudio {
 		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", *localPort), 3*time.Second)
 		if err != nil {
 			log.Printf("连接 audio socket 失败: %v", err)
@@ -218,7 +229,7 @@ func runSession(adb string, viewerConn net.Conn) {
 		return
 	}
 	defer controlConn.Close()
-	log.Printf("scrcpy-server 就绪 (scid=%s), 开始转发 (audio=%v)", scid, *audio)
+	log.Printf("scrcpy-server 就绪 (scid=%s), 开始转发 (audio=%v)", scid, wantAudio)
 
 	fw := NewFrameWriter(viewerConn)
 	done := make(chan string, 4)
@@ -230,17 +241,25 @@ func runSession(adb string, viewerConn net.Conn) {
 	} else {
 		fw.WriteFrame(ChAudio, make([]byte, 4)) // 主动告知观看端: 音频禁用
 	}
-	go func() { // 上行: 观看端帧 → 控制消息注入
+	go func() { // 上行: 观看端帧 → 控制消息注入 / 音频开关
 		for {
 			ch, payload, err := ReadFrame(viewerConn)
 			if err != nil {
 				done <- fmt.Sprintf("观看端断开 (%v)", err)
 				return
 			}
-			if ch == ChControl {
+			switch ch {
+			case ChControl:
 				if _, err := controlConn.Write(payload); err != nil {
 					done <- fmt.Sprintf("控制注入中断 (%v)", err)
 					return
+				}
+			case ChAudioToggle:
+				// 观看端静音时干脆别传, 省的是公网中继的流量
+				if len(payload) == 1 {
+					on := payload[0] == 1
+					audioMuted.Store(!on)
+					log.Printf("[音频] 观看端%s声音转发", map[bool]string{true: "开启", false: "关闭"}[on])
 				}
 			}
 		}
@@ -253,8 +272,14 @@ func runSession(adb string, viewerConn net.Conn) {
 	log.Print(<-done) // 任一关键通路结束即拆会话, defer 链完成清理
 }
 
+// 观看端是否临时关掉了声音(不拆流, 只是不转发, 这样随时能开回来)
+var audioMuted atomic.Bool
+
 // pumpMedia: 读媒体 socket 并转成帧下发。先透传 metaLen 字节的 codec meta,
 // 之后循环解析 scrcpy 的 [8B pts+flags][4B size][payload] 包。
+//
+// 音频通路上还做两件省流量的事: 观看端静音时直接丢弃, 以及静音抑制(见 silence.go)。
+// 注意即便不转发也必须把 socket 读干净, 否则 scrcpy-server 会被背压卡住。
 func pumpMedia(fw *FrameWriter, ch byte, src net.Conn, metaLen int) string {
 	name := map[byte]string{ChVideo: "视频", ChAudio: "音频"}[ch]
 	meta := make([]byte, metaLen)
@@ -267,6 +292,19 @@ func pumpMedia(fw *FrameWriter, ch byte, src net.Conn, metaLen int) string {
 	if ch == ChAudio && binary.BigEndian.Uint32(meta) == 0 {
 		return "手机A 端音频不可用 (需 Android 11+)"
 	}
+
+	var quiet *silenceDetector
+	if ch == ChAudio {
+		quiet = &silenceDetector{}
+		defer func() {
+			s, f := quiet.Suppressed.Load(), quiet.Forwarded.Load()
+			if s+f > 0 {
+				log.Printf("[音频] 静音抑制 %d 帧 / 共 %d 帧 (省了 %.0f%%)",
+					s, s+f, 100*float64(s)/float64(s+f))
+			}
+		}()
+	}
+
 	hdr := make([]byte, 12)
 	var total int64
 	for {
@@ -281,6 +319,15 @@ func pumpMedia(fw *FrameWriter, ch byte, src net.Conn, metaLen int) string {
 		if _, err := io.ReadFull(src, payload); err != nil {
 			return fmt.Sprintf("%s流中断 (%v)", name, err)
 		}
+
+		if quiet != nil {
+			isConfig := binary.BigEndian.Uint64(hdr[:8])&(1<<63) != 0
+			// config 帧(AudioSpecificConfig)必须放行, 否则观看端建不起解码器
+			if !isConfig && (audioMuted.Load() || !quiet.Feed(payload)) {
+				continue
+			}
+		}
+
 		total += int64(size)
 		if err := fw.WriteFrame(ch, hdr[:8], payload); err != nil {
 			return fmt.Sprintf("%s 下发中断 (已转发 %s, %v)", name, humanBytes(total), err)

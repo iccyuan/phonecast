@@ -1,5 +1,7 @@
 package com.phonecast.viewer
 
+import android.content.res.Resources
+import android.media.MediaFormat
 import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
@@ -32,6 +34,8 @@ class StreamClient(
     interface Listener {
         /** 连上了; addr 是实际用上的地址, viaLan 表示走的是局域网 */
         fun onConnected(addr: String, viaLan: Boolean)
+        /** 视频编码类型: "h264" / "h265" / "av01" —— 决定用哪个解码器 */
+        fun onVideoCodec(fourcc: String)
         /** 配对成功, 保存令牌供下次免输 */
         fun onPaired(token: String)
         fun onCodecMeta(width: Int, height: Int)
@@ -42,6 +46,8 @@ class StreamClient(
         fun onTokenRejected()
         /** 电脑端告知正在投的是哪台手机(机型), 用于列表显示 */
         fun onDeviceName(name: String)
+        /** 电脑端告知它当前的局域网地址, 用于刷新本地保存的直连路径 */
+        fun onLanAddrs(addrs: List<String>)
         fun onDisconnected(reason: String)
     }
 
@@ -53,6 +59,9 @@ class StreamClient(
         const val CH_AUTH_RESPONSE = 0x21
         const val CH_AUTH_RESULT = 0x22
         const val CH_DEVICE_INFO = 0x23
+        const val CH_LAN_ADDRS = 0x24
+        const val CH_CLIENT_INFO = 0x30
+        const val CH_AUDIO_TOGGLE = 0x31
         const val FLAG_CONFIG = 1L shl 63
         const val PTS_MASK = (1L shl 62) - 1 // bit62=关键帧标记
         const val MAX_FRAME = 8 shl 20
@@ -61,6 +70,7 @@ class StreamClient(
     private var socket = Socket()
     private val sendQueue = LinkedBlockingQueue<ByteArray>()
     @Volatile private var closed = false
+    @Volatile private var wantAudio = true
 
     fun start() = thread(name = "stream-reader") { runReader() }
 
@@ -110,6 +120,8 @@ class StreamClient(
             val (input, _) = connectAny() ?: return
             // 认证在 sender 线程启动前完成, 写端此刻独占, 无需与队列竞争
             if (!doAuth(input)) return
+            // 上报本机屏幕与解码能力: 电脑据此决定编码分辨率与是否用 H.265
+            sendFrame(CH_CLIENT_INFO, clientInfo().toByteArray())
             thread(name = "stream-sender") { runSender() }
 
             var videoMetaSeen = false
@@ -123,8 +135,10 @@ class StreamClient(
                 when (ch) {
                     CH_VIDEO -> if (!videoMetaSeen) {
                         videoMetaSeen = true
-                        val buf = ByteBuffer.wrap(data) // u32 codecId + u32 w + u32 h
-                        buf.int
+                        // u32 codecId(fourcc) + u32 w + u32 h
+                        val buf = ByteBuffer.wrap(data)
+                        val fourcc = ByteArray(4).also { buf.get(it) }
+                        listener.onVideoCodec(String(fourcc).trim { it.code == 0 })
                         listener.onCodecMeta(buf.int, buf.int)
                     } else emitMedia(data, listener::onPacket)
                     CH_AUDIO -> if (!audioMetaSeen) {
@@ -132,6 +146,8 @@ class StreamClient(
                         if (ByteBuffer.wrap(data).int == 0) listener.onAudioDisabled("手机A 端音频不可用")
                     } else emitMedia(data, listener::onAudioPacket)
                     CH_DEVICE_INFO -> listener.onDeviceName(String(data))
+                    CH_LAN_ADDRS -> listener.onLanAddrs(
+                        String(data).split(',').map { it.trim() }.filter { it.isNotEmpty() })
                 }
             }
         } catch (e: Exception) {
@@ -198,6 +214,26 @@ class StreamClient(
         }.toByteArray()
     }
 
+    /**
+     * 上报本机能力: 屏幕像素(决定编码分辨率, 免得按被控机原生分辨率浪费码率)、
+     * 能否硬解 H.265、是否要音频。
+     */
+    private fun clientInfo(): String {
+        val dm = Resources.getSystem().displayMetrics
+        val h265 = Codecs.canDecode(MediaFormat.MIMETYPE_VIDEO_HEVC)
+        return "w=${dm.widthPixels};h=${dm.heightPixels};h265=${if (h265) 1 else 0};audio=${if (wantAudio) 1 else 0}"
+    }
+
+    /** 运行中切换声音: 关掉后电脑直接不发, 省的是链路流量而不只是本机音量 */
+    fun setAudioEnabled(on: Boolean) {
+        wantAudio = on
+        sendQueue.offer(frameBytes(CH_AUDIO_TOGGLE, byteArrayOf(if (on) 1 else 0)))
+    }
+
+    private fun frameBytes(ch: Int, payload: ByteArray): ByteArray =
+        ByteBuffer.allocate(5 + payload.size)
+            .put(ch.toByte()).putInt(payload.size).put(payload).array()
+
     /** 直接写一帧 (认证阶段用, 此时 sender 线程还没接管写端) */
     private fun sendFrame(ch: Int, payload: ByteArray) {
         val out = socket.getOutputStream()
@@ -214,11 +250,9 @@ class StreamClient(
         try {
             val out = socket.getOutputStream()
             while (!closed) {
-                val msg = sendQueue.take()
-                if (msg.isEmpty()) continue
-                val frame = ByteBuffer.allocate(5 + msg.size)
-                    .put(CH_CONTROL.toByte()).putInt(msg.size).put(msg)
-                out.write(frame.array())
+                val frame = sendQueue.take() // 队列里放的是完整帧, 便于混发控制/音频开关
+                if (frame.isEmpty()) continue
+                out.write(frame)
                 out.flush()
             }
         } catch (_: Exception) {
@@ -226,8 +260,9 @@ class StreamClient(
         }
     }
 
+    /** 发一条 scrcpy 控制消息(触摸/按键) */
     fun send(msg: ByteArray) {
-        if (!closed) sendQueue.offer(msg)
+        if (!closed) sendQueue.offer(frameBytes(CH_CONTROL, msg))
     }
 
     fun close() {

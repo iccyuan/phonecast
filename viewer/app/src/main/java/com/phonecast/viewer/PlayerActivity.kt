@@ -2,6 +2,7 @@ package com.phonecast.viewer
 
 import android.app.Activity
 import android.graphics.Color
+import android.graphics.Rect
 import android.media.MediaCodec
 import android.media.MediaCodecList
 import android.media.MediaCodecInfo.CodecCapabilities
@@ -40,7 +41,19 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
     private lateinit var surfaceView: SurfaceView
     private lateinit var statusText: TextView
 
+    private companion object {
+        // 约 1 秒余量: 再多就是延迟而不是"平滑"
+        const val MAX_PENDING_PACKETS = 60
+    }
+
+    private lateinit var audioBtn: View
+    private var audioOn = true
+
     private val packets = LinkedBlockingQueue<Packet>()
+    @Volatile private var videoFourcc = "h264"
+    @Volatile private var waitingForKeyframe = false
+    private var droppedBacklog = 0
+    private var droppedLate = 0
     private val surfaceReady = CountDownLatch(1)
     private val metaReady = CountDownLatch(1)
 
@@ -74,13 +87,37 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
                 FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
         }
 
-        setContentView(LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+        // 不再放「返回/主页/多任务」三个键: 手势时代直接在画面里比划更自然,
+        // 那三个键反而占地方。取而代之的是画面四周留出安全边距(见 fitSurface),
+        // 边距内是本机手势区, 边距内侧的画面区则把本机手势屏蔽掉交给被控手机。
+        val exitBtn = View(this).apply {
+            background = Ui.circleButton(this@PlayerActivity,
+                Icons.Close(this@PlayerActivity, Color.WHITE), 0x99000000.toInt(), 9)
+            contentDescription = "断开"
+            setOnClickListener { finish() }
+        }
+        // 声音开关: 关掉后电脑直接不再发送音频, 省的是链路流量而不只是本机音量
+        audioBtn = View(this).apply {
+            contentDescription = "声音"
+            setOnClickListener { toggleAudio() }
+        }
+        updateAudioIcon()
+
+        setContentView(FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
-            addView(container, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
-            addView(navBar(), LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, Ui.dp(context, 62)))
+            addView(container, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            // 两个按钮都放在边距区里, 不压占画面
+            addView(exitBtn, FrameLayout.LayoutParams(
+                Ui.dp(context, 34), Ui.dp(context, 34), Gravity.TOP or Gravity.END).apply {
+                topMargin = Ui.dp(context, 8)
+                rightMargin = Ui.dp(context, 8)
+            })
+            addView(audioBtn, FrameLayout.LayoutParams(
+                Ui.dp(context, 34), Ui.dp(context, 34), Gravity.TOP or Gravity.END).apply {
+                topMargin = Ui.dp(context, 8)
+                rightMargin = Ui.dp(context, 50)
+            })
         })
 
         room = intent.getStringExtra("room") ?: ""
@@ -89,57 +126,6 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
             addrs, room, intent.getStringExtra("code") ?: "", Tokens.get(this, room), this)
         client.start()
         thread(name = "decoder-input") { runDecoder() }
-    }
-
-    /**
-     * 底部操作栏: 左侧三个键发给【被投屏的手机】, 用竖线分隔后右侧是退出本次投屏(本机)。
-     * 图标 + 小字标签, 既像系统导航条又能说清各自作用。
-     */
-    private fun navBar(): LinearLayout {
-        val c = this
-        fun item(icon: android.graphics.drawable.Drawable, label: String, tint: Int, onClick: () -> Unit) =
-            LinearLayout(c).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
-                background = Ui.rowBackground(c)
-                setOnClickListener { onClick() }
-                addView(View(c).apply { background = icon },
-                    LinearLayout.LayoutParams(Ui.dp(c, 22), Ui.dp(c, 22)))
-                addView(TextView(c).apply {
-                    text = label
-                    setTextColor(tint)
-                    textSize = 10f
-                    setPadding(0, Ui.dp(c, 3), 0, 0)
-                })
-            }
-
-        return LinearLayout(c).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(Ui.SURFACE)
-            val pad = Ui.dp(c, 6)
-            setPadding(pad, pad, pad, pad)
-
-            addView(item(Icons.NavBack(), "返回", Ui.MUTED) {
-                ControlMessages.keyPress(ControlMessages.KEYCODE_BACK).forEach(client::send)
-            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
-            addView(item(Icons.NavHome(c), "主页", Ui.MUTED) {
-                ControlMessages.keyPress(ControlMessages.KEYCODE_HOME).forEach(client::send)
-            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
-            addView(item(Icons.NavRecents(c), "多任务", Ui.MUTED) {
-                ControlMessages.keyPress(ControlMessages.KEYCODE_APP_SWITCH).forEach(client::send)
-            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
-
-            // 分隔线: 左边控制远端, 右边作用于本机
-            addView(View(c).apply { setBackgroundColor(Ui.BORDER) },
-                LinearLayout.LayoutParams(Ui.dp(c, 1), Ui.dp(c, 26)).apply {
-                    leftMargin = Ui.dp(c, 4)
-                    rightMargin = Ui.dp(c, 4)
-                })
-
-            addView(item(Icons.Close(c, Ui.DIM), "断开", Ui.DIM) { finish() },
-                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 0.9f))
-        }
     }
 
     // ---- StreamClient.Listener (非 UI 线程) ----
@@ -169,8 +155,33 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
         Tokens.clear(this, room)
     }
 
+    override fun onVideoCodec(fourcc: String) {
+        videoFourcc = fourcc
+    }
+
+    private fun toggleAudio() {
+        audioOn = !audioOn
+        client.setAudioEnabled(audioOn)
+        audioPlayer.setMuted(!audioOn)
+        updateAudioIcon()
+        Toast.makeText(this,
+            if (audioOn) "已开启声音" else "已关闭声音(电脑端同时停止发送)",
+            Toast.LENGTH_SHORT).show()
+    }
+
+    private fun updateAudioIcon() {
+        audioBtn.background = Ui.circleButton(this,
+            if (audioOn) Icons.SoundOn(this) else Icons.SoundOff(this),
+            0x99000000.toInt(), 9)
+    }
+
     override fun onDeviceName(name: String) {
         Saved.setName(this, room, name)
+    }
+
+    override fun onLanAddrs(addrs: List<String>) {
+        // 电脑换了 WiFi 后 IP 会变, 用它报来的地址替换旧的, 下次即可直接走局域网
+        Saved.updateLanAddrs(this, room, addrs)
     }
 
     override fun onAudioPacket(isConfig: Boolean, ptsUs: Long, data: ByteArray) {
@@ -188,8 +199,39 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
         runOnUiThread { fitSurface() }
     }
 
+    /**
+     * 入口侧限深: 队列无上限的话, 网络抖动积压的帧会让延迟单调增长("越用越卡")。
+     * 超限时丢到下一个关键帧为止 —— P 帧依赖参考帧, 不能随便挑着丢。
+     */
     override fun onPacket(isConfig: Boolean, ptsUs: Long, data: ByteArray) {
+        if (packets.size >= MAX_PENDING_PACKETS) {
+            packets.clear()
+            waitingForKeyframe = true
+            droppedBacklog++
+        }
+        if (waitingForKeyframe) {
+            if (!isConfig && !isKeyframe(data)) return
+            waitingForKeyframe = false
+        }
         packets.offer(Packet(isConfig, ptsUs, data))
+    }
+
+    /** 从 Annex-B 起始码后的 NAL 头判断关键帧 (H.264: IDR=5; H.265: IDR_W_RADL/N_LP=19/20) */
+    private fun isKeyframe(data: ByteArray): Boolean {
+        var i = 0
+        while (i + 4 < data.size) {
+            if (data[i].toInt() == 0 && data[i + 1].toInt() == 0 && data[i + 2].toInt() == 1) {
+                val nal = data[i + 3].toInt() and 0xFF
+                return if (videoFourcc == "h265") {
+                    val type = (nal shr 1) and 0x3F
+                    type in 16..21 || type in 32..34 // IRAP 或 VPS/SPS/PPS
+                } else {
+                    (nal and 0x1F) in intArrayOf(5, 7, 8)
+                }
+            }
+            i++
+        }
+        return false
     }
 
     override fun onDisconnected(reason: String) {
@@ -213,12 +255,13 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
         if (!running) return
 
         val codec: MediaCodec
+        val mime = Codecs.mimeFor(videoFourcc)
         try {
-            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, videoW, videoH)
+            val format = MediaFormat.createVideoFormat(mime, videoW, videoH)
             val name = MediaCodecList(MediaCodecList.REGULAR_CODECS).findDecoderForFormat(format)
             codec = MediaCodec.createByCodecName(name)
             if (Build.VERSION.SDK_INT >= 30 &&
-                codec.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                codec.codecInfo.getCapabilitiesForType(mime)
                     .isFeatureSupported(CodecCapabilities.FEATURE_LowLatency)
             ) {
                 format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
@@ -226,7 +269,7 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
             codec.configure(format, surfaceView.holder.surface, null, 0)
             codec.start()
         } catch (e: Exception) {
-            onDisconnected("解码器初始化失败: ${e.message}")
+            onDisconnected("解码器初始化失败($mime): ${e.message}")
             return
         }
 
@@ -265,15 +308,35 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
         }
     }
 
+    /**
+     * 输出侧: 只渲染"最新"的一帧。
+     * 若解码器一次吐出多帧(网络抖动后追赶), 把旧的以 render=false 丢掉 ——
+     * 投屏是实时画面, 播放过期帧只会让延迟固化下来。
+     */
     private fun drainOutput(codec: MediaCodec) {
         val info = MediaCodec.BufferInfo()
         try {
             while (running) {
-                val idx = codec.dequeueOutputBuffer(info, 100_000)
-                when {
-                    idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> onOutputFormat(codec.outputFormat)
-                    idx >= 0 -> codec.releaseOutputBuffer(idx, true)
+                var idx = codec.dequeueOutputBuffer(info, 100_000)
+                if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    onOutputFormat(codec.outputFormat)
+                    continue
                 }
+                if (idx < 0) continue
+
+                // 看看后面还有没有已经就绪的帧: 有就说明当前这帧已经过期
+                while (true) {
+                    val next = codec.dequeueOutputBuffer(info, 0)
+                    if (next < 0) break
+                    if (next == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        onOutputFormat(codec.outputFormat)
+                        continue
+                    }
+                    codec.releaseOutputBuffer(idx, false) // 丢掉旧帧, 不上屏
+                    droppedLate++
+                    idx = next
+                }
+                codec.releaseOutputBuffer(idx, true)
             }
         } catch (_: Exception) {
             // codec 停止时的 IllegalStateException, 正常退出
@@ -296,14 +359,37 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
         }
     }
 
-    /** 按视频宽高比把 SurfaceView 等比缩放并居中, 让触摸坐标可线性映射。 */
+    /**
+     * 按视频宽高比等比缩放并居中, 让触摸坐标可线性映射。
+     *
+     * 关键点: 当被控手机的分辨率不小于本机时, 画面会铺到屏幕边缘, 此时从边缘发起的
+     * 滑动会被【本机】的系统手势(返回/主页)截走, 传不到被控手机。所以这种情况下四周
+     * 留出一圈空白: 空白区是本机手势区, 画面区是被控手机的操作区, 两者互不打架。
+     */
     private fun fitSurface() {
         val vw = videoW
         val vh = videoH
         if (vw == 0 || vh == 0 || container.width == 0) return
-        val scale = minOf(container.width.toFloat() / vw, container.height.toFloat() / vh)
-        surfaceView.layoutParams = FrameLayout.LayoutParams(
-            (vw * scale).toInt(), (vh * scale).toInt(), Gravity.CENTER)
+
+        val dm = resources.displayMetrics
+        val remoteNotSmaller = vw >= dm.widthPixels || vh >= dm.heightPixels
+        val inset = if (remoteNotSmaller) Ui.dp(this, 22) else 0
+
+        val availW = (container.width - inset * 2).coerceAtLeast(1)
+        val availH = (container.height - inset * 2).coerceAtLeast(1)
+        val scale = minOf(availW.toFloat() / vw, availH.toFloat() / vh)
+        val w = (vw * scale).toInt()
+        val h = (vh * scale).toInt()
+        surfaceView.layoutParams = FrameLayout.LayoutParams(w, h, Gravity.CENTER)
+
+        // 画面区内屏蔽本机系统手势, 让边缘滑动落到被控手机上
+        // (系统对每条边的豁免高度有上限, 拿不满也能显著改善)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            surfaceView.post {
+                surfaceView.systemGestureExclusionRects =
+                    listOf(Rect(0, 0, surfaceView.width, surfaceView.height))
+            }
+        }
     }
 
     // ---- 触摸 ----

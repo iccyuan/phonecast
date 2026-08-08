@@ -23,8 +23,16 @@ class AudioPlayer {
     @Volatile private var running = true
     private var started = false
 
+    @Volatile private var muted = false
+
+    /** 本机静音: 电脑端也会停发, 这里只是兜住途中还在路上的那几帧 */
+    fun setMuted(on: Boolean) {
+        muted = on
+        if (on) queue.clear()
+    }
+
     fun feed(isConfig: Boolean, ptsUs: Long, data: ByteArray) {
-        if (!running) return
+        if (!running || (muted && !isConfig)) return
         if (isConfig) {
             if (!started) {
                 started = true

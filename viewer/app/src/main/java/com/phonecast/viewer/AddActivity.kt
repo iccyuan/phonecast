@@ -116,12 +116,14 @@ class AddActivity : Activity() {
             Toast.makeText(this, "请填写设备名", Toast.LENGTH_SHORT).show()
             return
         }
-        if (code.isEmpty() && Tokens.get(this, addr, room) == null) {
+        if (code.isEmpty() && Tokens.get(this, room) == null) {
             Toast.makeText(this, "首次配对请填电脑端显示的 6 位配对码", Toast.LENGTH_SHORT).show()
             return
         }
-        Saved.touch(this, Entry(addr, room))
-        startActivity(Player.intent(this, Entry(addr, room), code))
+        // 手动只填一个地址; 之后扫码若带来另一条路径会自动合并
+        val entry = Entry(room, listOf(addr))
+        Saved.touch(this, entry)
+        startActivity(Player.intent(this, Saved.list(this).first { it.room == room }, code))
         finish()
     }
 
@@ -169,9 +171,7 @@ class AddActivity : Activity() {
 object Player {
     fun intent(c: android.content.Context, e: Entry, code: String): Intent =
         Intent(c, PlayerActivity::class.java)
-            .putExtra("host", e.host)
-            .putExtra("port", e.port)
-            .putExtra("addr", e.addr)
+            .putStringArrayListExtra("addrs", ArrayList(e.addrs))
             .putExtra("room", e.room)
             .putExtra("code", code)
 }

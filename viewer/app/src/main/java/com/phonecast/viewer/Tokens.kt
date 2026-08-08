@@ -3,21 +3,22 @@ package com.phonecast.viewer
 import android.content.Context
 
 /**
- * 设备令牌本地存储: 每个 (地址, 设备名) 一枚。
- * 配对成功后由电脑端下发, 此后连接免输配对码; 电脑端撤销时本地也会清掉。
+ * 设备令牌本地存储。
+ * 按【设备名】存, 不带地址 —— 同一台电脑无论走局域网还是中继都是同一个 agent,
+ * 令牌通用; 而且局域网 IP 经常变, 绑地址会让配对白白失效。
  */
 object Tokens {
     private fun prefs(c: Context) = c.getSharedPreferences("phonecast_tokens", Context.MODE_PRIVATE)
-    private fun key(addr: String, room: String) = "t:$addr/$room"
+    private fun key(room: String) = "room:$room"
 
-    fun get(c: Context, addr: String, room: String): String? =
-        prefs(c).getString(key(addr, room), null)?.takeIf { it.isNotEmpty() }
+    fun get(c: Context, room: String): String? =
+        prefs(c).getString(key(room), null)?.takeIf { it.isNotEmpty() }
 
-    fun put(c: Context, addr: String, room: String, token: String) {
-        prefs(c).edit().putString(key(addr, room), token).apply()
+    fun put(c: Context, room: String, token: String) {
+        prefs(c).edit().putString(key(room), token).apply()
     }
 
-    fun clear(c: Context, addr: String, room: String) {
-        prefs(c).edit().remove(key(addr, room)).apply()
+    fun clear(c: Context, room: String) {
+        prefs(c).edit().remove(key(room)).apply()
     }
 }

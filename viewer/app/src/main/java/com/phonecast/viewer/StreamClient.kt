@@ -20,8 +20,8 @@ import kotlin.concurrent.thread
  *      ch2 控制: 上行, 每帧一条 scrcpy 控制消息
  */
 class StreamClient(
-    private val host: String,
-    private val port: Int,
+    /** 候选地址, 按优先级排列(局域网在前); 逐个尝试直到握手成功 */
+    private val addrs: List<String>,
     private val room: String,
     /** 首次配对用的 6 位配对码; 已配对(有令牌)时可为空 */
     private val code: String,
@@ -30,7 +30,8 @@ class StreamClient(
     private val listener: Listener,
 ) {
     interface Listener {
-        fun onConnected()
+        /** 连上了; addr 是实际用上的地址, viaLan 表示走的是局域网 */
+        fun onConnected(addr: String, viaLan: Boolean)
         /** 配对成功, 保存令牌供下次免输 */
         fun onPaired(token: String)
         fun onCodecMeta(width: Int, height: Int)
@@ -57,30 +58,58 @@ class StreamClient(
         const val MAX_FRAME = 8 shl 20
     }
 
-    private val socket = Socket()
+    private var socket = Socket()
     private val sendQueue = LinkedBlockingQueue<ByteArray>()
     @Volatile private var closed = false
 
     fun start() = thread(name = "stream-reader") { runReader() }
 
+    /**
+     * 逐个候选地址尝试建链: 局域网超时给得短(不通就 1.5 秒内失败), 中继给足 6 秒。
+     * 返回握手已完成的输入流, 全部失败则返回 null。
+     */
+    private fun connectAny(): Pair<DataInputStream, String>? {
+        var lastError = "没有可用地址"
+        for (addr in addrs) {
+            if (closed) return null
+            val lan = Entry.isLan(addr)
+            val s = Socket()
+            try {
+                s.tcpNoDelay = true
+                s.connect(InetSocketAddress(Entry.hostOf(addr), Entry.portOf(addr)),
+                    if (lan) 1500 else 6000)
+                s.getOutputStream().write(handshake())
+                val input = DataInputStream(BufferedInputStream(s.getInputStream(), 256 * 1024))
+                when (val status = input.readUnsignedByte()) {
+                    0 -> {
+                        socket = s
+                        listener.onConnected(addr, lan)
+                        return input to addr
+                    }
+                    // 设备名不在线: 这条路走不通(可能是同网段别的机器), 换下一条
+                    2 -> lastError = "设备名不在线 (电脑端未启动或设备名不对)"
+                    3 -> { // 已有观看端是明确结论, 换地址也一样, 直接结束
+                        s.close()
+                        fail("该电脑已有其他观看端在连")
+                        return null
+                    }
+                    4 -> lastError = "中继内部错误, 稍后重试"
+                    else -> lastError = "协议错误 (status=$status)"
+                }
+            } catch (e: Exception) {
+                lastError = e.message ?: e.javaClass.simpleName
+            }
+            runCatching { s.close() }
+        }
+        fail(if (addrs.size > 1) "都连不上: $lastError" else lastError)
+        return null
+    }
+
     private fun runReader() {
         try {
-            socket.tcpNoDelay = true
-            socket.connect(InetSocketAddress(host, port), 5000)
-            socket.getOutputStream().write(handshake())
-
-            val input = DataInputStream(BufferedInputStream(socket.getInputStream(), 256 * 1024))
-            when (val status = input.readUnsignedByte()) {
-                0 -> {}
-                1 -> return fail("密钥错误")
-                2 -> return fail("设备名不在线 (电脑端未启动或设备名不对)")
-                3 -> return fail("该电脑已有其他观看端在连")
-                4 -> return fail("中继内部错误, 稍后重试")
-                else -> return fail("协议错误 (status=$status)")
-            }
+            val (input, _) = connectAny() ?: return
             // 认证在 sender 线程启动前完成, 写端此刻独占, 无需与队列竞争
             if (!doAuth(input)) return
-            listener.onConnected()
             thread(name = "stream-sender") { runSender() }
 
             var videoMetaSeen = false

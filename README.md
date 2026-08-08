@@ -139,6 +139,14 @@ cd viewer; .\gradlew.bat :app:assembleDebug          # App (Gradle 8.9/AGP 8.5.2
 
 `relay/proto.go` 与 `hub/proto.go` 是同一文件的两份拷贝(两个独立 Go module),改协议时同步两处。scrcpy-server 换版本:下载对应 release 的 `scrcpy-server-vX.Y`,同步改 `relay/main.go` 的 `serverVersion`(server 启动第一个参数必须与 jar 版本完全一致),并核对控制消息布局。`scrcpy-server-v2.7` 来自 [Genymobile/scrcpy](https://github.com/Genymobile/scrcpy)(Apache-2.0)。
 
+## 连不上局域网时的排查
+
+电脑托盘会自动检测并提示。按出现频率排序:
+
+1. **手机开着 VPN / 科学上网(TUN 模式)**:最常见。VPN 会把去往局域网的流量一并吸进隧道,表现是"看似连上实则不通"(`nc` 探测甚至会返回 OPEN)。关掉 VPN,或打开它的「绕过局域网 / bypass private networks」选项。此时 App 会自动回落中继并给出提示。
+2. **Windows 防火墙没放行**:托盘菜单「允许局域网访问」一键添加(需管理员确认)。规则只放行本程序、且限定 `remoteip=LocalSubnet`(同网段)。注意 Windows 常把家用 WiFi 判为「公用网络」,所以规则对所有配置文件生效,否则形同虚设。
+3. **电脑上有虚拟网卡**(Docker / WSL / 代理 TUN):它们的地址手机连不上。二维码里会带上所有候选局域网地址,由手机逐个尝试,不依赖单一猜测。
+
 ## 已知边界
 
 - **一台电脑同时只投一台手机**:scrcpy-server 单实例,插多台时在托盘「选择被投屏手机」里切换(切换会重启会话)。同一时刻也只允许一个观看端。

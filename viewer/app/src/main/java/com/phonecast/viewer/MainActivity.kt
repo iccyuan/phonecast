@@ -295,7 +295,7 @@ class MainActivity : Activity() {
     /** 列表项: 图标 + (机型 / 连接坐标) + 状态点 + 进入箭头 */
     private fun row(e: Entry): View {
         val c = this
-        val paired = Tokens.get(c, e.addr, e.room) != null
+        val paired = Tokens.get(c, e.room) != null
         return LinearLayout(c).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -322,7 +322,7 @@ class MainActivity : Activity() {
                     addView(Ui.dot(c, if (paired) Ui.SUCCESS else Ui.WARN),
                         LinearLayout.LayoutParams(Ui.dp(c, 6), Ui.dp(c, 6)))
                     addView(TextView(c).apply {
-                        text = if (paired) "已配对  ·  ${e.addr}" else "待配对  ·  点击后输配对码"
+                        text = if (paired) "已配对  ·  ${e.routeLabel()}" else "待配对  ·  点击后输配对码"
                         setTextColor(if (paired) Ui.MUTED else Ui.WARN)
                         textSize = 12f
                         isSingleLine = true
@@ -344,11 +344,11 @@ class MainActivity : Activity() {
 
     private fun open(e: Entry) {
         Saved.touch(this, e)
-        if (Tokens.get(this, e.addr, e.room) != null) {
+        if (Tokens.get(this, e.room) != null) {
             startActivity(Player.intent(this, e, "")) // 已配对: 令牌免输
         } else {
             startActivity(Intent(this, AddActivity::class.java)
-                .putExtra("addr", e.addr)
+                .putExtra("addr", e.addrs.firstOrNull().orEmpty())
                 .putExtra("room", e.room))
         }
     }
@@ -366,20 +366,22 @@ class MainActivity : Activity() {
             .show()
     }
 
-    /** phonecast://c?a=地址&r=设备名&c=配对码 → 保存并直接连接 */
+    /** phonecast://c?l=局域网&a=中继&r=设备名&c=配对码 → 保存并直接连接(局域网优先) */
     private fun handleDeepLink(intent: Intent?) {
         val uri = intent?.data ?: return
         if (uri.scheme != "phonecast") return
-        val addr = uri.getQueryParameter("a").orEmpty()
         val room = uri.getQueryParameter("r").orEmpty()
         val code = uri.getQueryParameter("c").orEmpty()
+        // l 可能有多个(电脑有多张网卡时全带上), a 是中继
+        val addrs = Entry.order(
+            uri.getQueryParameters("l").orEmpty() + listOfNotNull(uri.getQueryParameter("a")))
         intent.data = null // 防止旋转等场景重复触发
-        if (addr.isEmpty() || room.isEmpty()) {
+        if (room.isEmpty() || addrs.isEmpty()) {
             Toast.makeText(this, "二维码内容不完整", Toast.LENGTH_SHORT).show()
             return
         }
-        val e = Entry(addr, room)
-        Saved.touch(this, e)
-        startActivity(Player.intent(this, e, code))
+        Saved.touch(this, Entry(room, addrs))
+        val merged = Saved.list(this).first { it.room == room } // 合并后的完整路径表
+        startActivity(Player.intent(this, merged, code))
     }
 }

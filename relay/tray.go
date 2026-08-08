@@ -37,6 +37,7 @@ func trayReady(e *engine) {
 	mPair := systray.AddMenuItem("显示配对二维码", "手机B 扫码即连, 无需手输")
 	mNewCode := systray.AddMenuItem("重新生成配对码", "作废旧码")
 	mForget := systray.AddMenuItem("撤销已配对手机", "让所有手机重新配对")
+	mFirewall := systray.AddMenuItem("允许局域网访问", "添加 Windows 防火墙入站规则(需管理员确认)")
 	mCopy := systray.AddMenuItem("复制手机端连接信息", "地址/设备名/配对码")
 	mConfig := systray.AddMenuItem("打开配置文件", "保存后点「重新运行」生效")
 	mLog := systray.AddMenuItem("查看日志", "")
@@ -143,6 +144,22 @@ func trayReady(e *engine) {
 					mbOKCancel|mbIconWarning) == idOK {
 					forgetDevices()
 				}
+			case <-mFirewall.ClickedCh:
+				go func() {
+					if firewallRuleExists() {
+						messageBox("PhoneCast", "局域网直连已经放行, 无需重复添加。", mbOK|mbIconInfo)
+						return
+					}
+					if err := addFirewallRule(); err != nil {
+						alertf("添加防火墙规则失败: %v\n\n可手动执行(管理员命令行):\nnetsh advfirewall firewall add rule name=\"%s\" dir=in action=allow program=\"<本程序路径>\" enable=yes", err, firewallRuleName)
+						return
+					}
+					if firewallRuleExists() {
+						messageBox("PhoneCast", "已放行局域网直连,现在手机可以走局域网连接了。", mbOK|mbIconInfo)
+					} else {
+						alertf("规则似乎没添加成功, 请确认刚才的管理员提示是否被取消。")
+					}
+				}()
 			case <-mCopy.ClickedCh:
 				if err := setClipboard(connInfoText()); err == nil {
 					alertOnceCopied()

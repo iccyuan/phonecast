@@ -119,6 +119,7 @@ func (e *engine) run(ctx context.Context) {
 		return
 	}
 	banner()
+	go checkFirewall() // 局域网连不上最常见的原因就是这条规则没加
 	if *listen != "" {
 		go e.serveDirect(ctx)
 	}
@@ -178,6 +179,7 @@ func (e *engine) serveDirect(ctx context.Context) {
 		log.Printf("[直连] 监听 %s 失败 (端口被占用?): %v", *listen, err)
 		return
 	}
+	log.Printf("[直连] 已监听 %s", *listen)
 	e.track(ln)
 	defer func() { e.untrack(ln); ln.Close() }()
 	for {
@@ -196,20 +198,30 @@ func (e *engine) handleDirectViewer(conn net.Conn) {
 	e.track(conn)
 	defer func() { e.untrack(conn); conn.Close() }()
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	peer := conn.RemoteAddr().String()
+	log.Printf("[直连] 收到来自 %s 的连接", peer)
 
 	var magic [4]byte
-	if _, err := io.ReadFull(conn, magic[:]); err != nil || magic != MagicViewer {
+	if _, err := io.ReadFull(conn, magic[:]); err != nil {
+		log.Printf("[直连] %s 读握手失败: %v", peer, err)
+		return
+	}
+	if magic != MagicViewer {
+		log.Printf("[直连] %s 协议头不对 (%q), 可能是端口扫描或版本不匹配", peer, magic)
 		return
 	}
 	gotRoom, err := ReadLenPrefixed(conn)
 	if err != nil {
+		log.Printf("[直连] %s 读设备名失败: %v", peer, err)
 		return
 	}
 	if gotRoom != *room { // 设备名只是路由标识, 真正的门在下面的配对码认证
+		log.Printf("[直连] %s 设备名不符: 收到 %q, 本机是 %q", peer, gotRoom, *room)
 		conn.Write([]byte{StatusNoRoom})
 		return
 	}
 	if !sessionMu.TryLock() {
+		log.Printf("[直连] %s 被拒: 已有观看端在连", peer)
 		conn.Write([]byte{StatusBusy})
 		return
 	}

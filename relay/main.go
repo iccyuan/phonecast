@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -115,11 +116,7 @@ func banner() {
 // 比照着念地址/配对码省事 (电脑与手机的剪贴板并不互通)。
 func connInfoText() string {
 	var b strings.Builder
-	primary := *hubAddr
-	if primary == "" {
-		primary = firstLanIP() + *listen
-	}
-	fmt.Fprintf(&b, "PhoneCast 连接链接(手机上点开即连):\r\n%s\r\n\r\n", pairURI(primary))
+	fmt.Fprintf(&b, "PhoneCast 连接链接(手机上点开即连):\r\n%s\r\n\r\n", pairURI())
 	if *hubAddr != "" {
 		fmt.Fprintf(&b, "地址: %s\r\n", *hubAddr)
 	}
@@ -376,20 +373,77 @@ func randomToken(n int) string {
 
 func firstLanIP() string {
 	if ips := lanIPs(); len(ips) > 0 {
-		return ips[len(ips)-1] // 通常最后一个是物理网卡地址 (虚拟网卡排前面)
+		return ips[0]
 	}
 	return "<本机IP>"
 }
 
+// 虚拟网卡关键字: Docker/WSL/Hyper-V/VMware/VirtualBox 等的地址手机根本连不上,
+// 之前"提示的 IP 不对"就是被这些网卡顶掉了真实无线网卡。
+var virtualNICKeywords = []string{
+	"docker", "vethernet", "hyper-v", "vmware", "virtualbox", "vmnet",
+	"wsl", "loopback", "tap-", "tailscale", "zerotier", "bluetooth",
+	// 代理/VPN 的 TUN 网卡会抢占默认路由, 手机连它必然失败
+	"tun", "singbox", "sing-box", "clash", "v2ray", "wireguard", "openvpn", "utun", "ppp",
+}
+
+// lanIPs 返回手机可能连得上的本机 IPv4, 按可信度排序:
+// 系统默认出口网卡的地址排第一, 其余物理网卡在后; 虚拟网卡与链路本地(169.254)剔除。
+// 全部写进二维码, 由手机逐个尝试, 免得我们在这边猜错。
 func lanIPs() []string {
 	var ips []string
-	addrs, _ := net.InterfaceAddrs()
-	for _, a := range addrs {
-		if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil && !ipn.IP.IsLoopback() {
-			ips = append(ips, ipn.IP.String())
+	seen := map[string]bool{}
+	add := func(ip string) {
+		if ip != "" && !seen[ip] {
+			seen[ip] = true
+			ips = append(ips, ip)
 		}
 	}
+
+	ifaces, _ := net.Interfaces()
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		name := strings.ToLower(ifc.Name)
+		if slices.ContainsFunc(virtualNICKeywords, func(k string) bool {
+			return strings.Contains(name, k)
+		}) {
+			continue
+		}
+		addrs, _ := ifc.Addrs()
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip4 := ipn.IP.To4()
+			if ip4 == nil || ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+				continue // 169.254.x.x 是没拿到 DHCP 的网卡, 连不上
+			}
+			add(ip4.String())
+		}
+	}
+
+	// 系统默认出口地址若确实属于物理网卡, 提到最前; 若它来自代理 TUN 就忽略。
+	if p := primaryOutboundIP(); seen[p] {
+		ips = append([]string{p}, slices.DeleteFunc(ips, func(s string) bool { return s == p })...)
+	}
 	return ips
+}
+
+// primaryOutboundIP: 系统访问外网时会用哪个本地地址。
+// UDP 的 Dial 不发包, 只是让内核按路由表选好源地址 —— 这是判断"主网卡"最可靠的办法。
+func primaryOutboundIP() string {
+	conn, err := net.Dial("udp4", "223.5.5.5:80")
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	if ua, ok := conn.LocalAddr().(*net.UDPAddr); ok && ua.IP.To4() != nil {
+		return ua.IP.String()
+	}
+	return ""
 }
 
 func humanBytes(n int64) string {

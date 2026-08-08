@@ -83,11 +83,10 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
                 LinearLayout.LayoutParams.MATCH_PARENT, Ui.dp(context, 62)))
         })
 
-        addr = intent.getStringExtra("addr") ?: ""
         room = intent.getStringExtra("room") ?: ""
+        val addrs = intent.getStringArrayListExtra("addrs") ?: arrayListOf()
         client = StreamClient(
-            intent.getStringExtra("host")!!, intent.getIntExtra("port", 27184),
-            room, intent.getStringExtra("code") ?: "", Tokens.get(this, addr, room), this)
+            addrs, room, intent.getStringExtra("code") ?: "", Tokens.get(this, room), this)
         client.start()
         thread(name = "decoder-input") { runDecoder() }
     }
@@ -145,21 +144,33 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
 
     // ---- StreamClient.Listener (非 UI 线程) ----
 
-    override fun onConnected() {
-        runOnUiThread { statusText.text = "已连接,等待画面..." }
+    override fun onConnected(addr: String, viaLan: Boolean) {
+        this.addr = addr
+        Saved.promote(this, room, addr) // 这条路通, 下次先试它
+        // 明明有局域网地址却回落到中继, 多半是手机开着 VPN 把局域网流量也吸走了
+        val lanSkipped = !viaLan && intent.getStringArrayListExtra("addrs")
+            ?.any { Entry.isLan(it) } == true
+        runOnUiThread {
+            statusText.text = if (viaLan) "已连接(局域网),等待画面…" else "已连接(中继),等待画面…"
+            if (lanSkipped) {
+                Toast.makeText(this,
+                    "局域网连不通,已走中继。若手机开着 VPN,请关闭或开启其「绕过局域网」选项",
+                    Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     override fun onPaired(token: String) {
-        Tokens.put(this, addr, room, token)
+        Tokens.put(this, room, token)
         runOnUiThread { Toast.makeText(this, "配对成功,下次无需再输配对码", Toast.LENGTH_SHORT).show() }
     }
 
     override fun onTokenRejected() {
-        Tokens.clear(this, addr, room)
+        Tokens.clear(this, room)
     }
 
     override fun onDeviceName(name: String) {
-        Saved.setName(this, addr, room, name)
+        Saved.setName(this, room, name)
     }
 
     override fun onAudioPacket(isConfig: Boolean, ptsUs: Long, data: ByteArray) {

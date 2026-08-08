@@ -19,7 +19,7 @@ import (
 const (
 	// 必须与发布 tag 一致: 更新检查是拿它跟 GitHub 上的 tag_name 比,
 	// 落后于已发布版本会导致每次启动都误报"有新版本"。
-	appVersion   = "0.7.2"
+	appVersion   = "0.7.3"
 	releasesAPI  = "https://api.github.com/repos/iccyuan/phonecast/releases/latest"
 	relayAssetZip = "phonecast-relay-windows.zip"
 	relayExeName  = "phonecast-relay.exe"

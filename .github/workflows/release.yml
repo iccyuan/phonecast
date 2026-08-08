@@ -43,10 +43,13 @@ jobs:
 
       # 签名必须每次一致, 否则应用内更新会因签名不符而拒绝安装。
       # keystore 以 base64 存在仓库 Secrets 里 (SIGNING_KEYSTORE_B64), 不入库。
+      # 逐项校验, 失败时直接指出是哪一项、是不是被粘贴带进了空白字符。
       - name: Prepare signing key
         env:
           KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
-          STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          RAW_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          RAW_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          RAW_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
           set -u
           KEY_PATH="$GITHUB_WORKSPACE/viewer/release.jks"
@@ -54,28 +57,47 @@ jobs:
             echo "::warning::未配置 SIGNING_KEYSTORE_B64, 将产出 debug 签名包(无法覆盖升级正式版)"
             exit 0
           fi
-          # 从 Windows 复制粘贴常会带进 \r 或换行, base64 -d 会因此报错
+
+          # 粘贴到 Secrets 时常见的尾随空格/换行/\r 会让口令对不上, 这里统一清掉
+          trim() { printf '%s' "$1" | tr -d '\r\n\t' | sed -e 's/^ *//' -e 's/ *$//'; }
+          SP=$(trim "$RAW_STORE_PASSWORD")
+          KA=$(trim "$RAW_KEY_ALIAS")
+          KP=$(trim "$RAW_KEY_PASSWORD")
+          echo "::add-mask::$SP"
+          echo "::add-mask::$KP"
+          echo "长度对比(清理前→后): STORE_PASSWORD ${#RAW_STORE_PASSWORD}→${#SP}, KEY_ALIAS ${#RAW_KEY_ALIAS}→${#KA}, KEY_PASSWORD ${#RAW_KEY_PASSWORD}→${#KP}"
+
           printf '%s' "$KEYSTORE_B64" | tr -d '\r\n \t' | base64 -d > "$KEY_PATH" || {
-            echo "::error::SIGNING_KEYSTORE_B64 不是合法的 base64, 请重新复制(整行, 无空格换行)"
+            echo "::error::SIGNING_KEYSTORE_B64 不是合法的 base64, 请只复制 base64 那一行"
             exit 1
           }
           SIZE=$(stat -c%s "$KEY_PATH")
-          echo "keystore 已还原, ${SIZE} 字节"
+          echo "keystore 已还原, ${SIZE} 字节 (本机原文件是 4382 字节)"
           [ "$SIZE" -gt 0 ] || { echo "::error::还原出来是空文件"; exit 1; }
-          # 用口令试开一次, 口令错的话在这里就能说清楚, 不必等到签名步骤
-          if ! keytool -list -keystore "$KEY_PATH" -storepass "$STORE_PASSWORD" > /dev/null 2>&1; then
-            echo "::error::keystore 打不开: SIGNING_STORE_PASSWORD 不对, 或 base64 内容不完整"
+
+          if ! keytool -list -keystore "$KEY_PATH" -storepass "$SP" > /dev/null 2>&1; then
+            echo "::error::口令打不开 keystore。若上面 keystore 字节数与本机一致, 那就是 SIGNING_STORE_PASSWORD 的值不对(长度 ${#SP})"
             exit 1
           fi
-          echo "SIGNED=1" >> "$GITHUB_ENV"
+          if ! keytool -list -keystore "$KEY_PATH" -alias "$KA" -storepass "$SP" > /dev/null 2>&1; then
+            echo "::error::keystore 里没有别名 '${KA}', 检查 SIGNING_KEY_ALIAS"
+            exit 1
+          fi
+          echo "签名配置校验通过"
+
+          # 传清理后的值给 Gradle, 避免它再撞上同样的空白问题
+          {
+            echo "SIGNED=1"
+            echo "SIGNING_STORE_PASSWORD=$SP"
+            echo "SIGNING_KEY_ALIAS=$KA"
+            echo "SIGNING_KEY_PASSWORD=$KP"
+          } >> "$GITHUB_ENV"
 
       - name: Build viewer APK
         working-directory: viewer
         env:
+          # 口令/别名来自上一步清理后的 GITHUB_ENV, 不再直接取原始 secret
           SIGNING_STORE_FILE: ${{ github.workspace }}/viewer/release.jks
-          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
-          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
-          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
           chmod +x gradlew
           if [ "$SIGNED" = "1" ]; then

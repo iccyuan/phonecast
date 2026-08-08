@@ -39,6 +39,18 @@ const (
 	ChClientInfo   = 0x30 // payload="w=1080;h=2400;h265=1;audio=1" 形式的 UTF-8
 	ChAudioToggle  = 0x31 // payload=1 字节, 1=要音频 0=不要 (运行中可随时切)
 
+	// 时延探测: viewer 发 8 字节自有时间戳, agent 原样回弹。
+	// 手机A/电脑/手机B 三个时钟不同步, 没法直接相减, 所以用回环 RTT 量网络段,
+	// 解码与上屏则在手机B 自己的时钟域里量 —— 两者相加即可估出端到端时延。
+	ChLatencyPing = 0x32
+
+	// 观看端上报拥塞信号 (viewer→agent, 每 2s): "rtt=..;drops=..;pending=.."
+	ChNetReport = 0x33
+	// 视频通道即将重来一遍 (agent→viewer): 编码参数变了, 要重建解码器。
+	// scrcpy-server 不支持运行中改码率, 只能重启编码会话, 所以必须有这个信号 ——
+	// 否则观看端会拿旧解码器去解新码流, 直接黑屏。
+	ChVideoReset = 0x25
+
 	// 握手响应状态码
 	StatusOK     = 0
 	StatusBadKey = 1

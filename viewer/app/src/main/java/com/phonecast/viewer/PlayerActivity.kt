@@ -48,14 +48,20 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
 
     private lateinit var audioBtn: View
     private var audioOn = true
+    private lateinit var statsText: TextView
+    private var statsOn = false
+    private val statsHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
     private val packets = LinkedBlockingQueue<Packet>()
     @Volatile private var videoFourcc = "h264"
     @Volatile private var waitingForKeyframe = false
-    private var droppedBacklog = 0
-    private var droppedLate = 0
+
+    /** PTS → 收到时刻(本机纳秒), 用于测"收到→上屏" */
+    private val recvAt = HashMap<Long, Long>()
     private val surfaceReady = CountDownLatch(1)
-    private val metaReady = CountDownLatch(1)
+    /** 每"一代"解码器一个: 编码器重启后换新的, 等新 codec meta */
+    @Volatile private var metaLatch = CountDownLatch(1)
+    @Volatile private var generation = 0
 
     @Volatile private var running = true
     // 触摸坐标映射用的当前视频尺寸: 先取 codec meta, 之后跟随解码器输出(手机A 旋转会变)
@@ -103,6 +109,24 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
         }
         updateAudioIcon()
 
+        // 指标面板: 码率/帧率/RTT/上屏时延/积压, 排查卡顿时不用靠猜
+        statsText = TextView(this).apply {
+            setTextColor(0xFF9FE8B0.toInt())
+            textSize = 10f
+            typeface = android.graphics.Typeface.MONOSPACE
+            background = Ui.rounded(this@PlayerActivity, 0xCC000000.toInt(), 8)
+            val p = Ui.dp(this@PlayerActivity, 8)
+            setPadding(p, p, p, p)
+            visibility = View.GONE
+            setLineSpacing(0f, 1.15f)
+        }
+        val statsBtn = View(this).apply {
+            background = Ui.circleButton(this@PlayerActivity,
+                Icons.Info(this@PlayerActivity), 0x99000000.toInt(), 9)
+            contentDescription = "链路指标"
+            setOnClickListener { toggleStats() }
+        }
+
         setContentView(FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             addView(container, FrameLayout.LayoutParams(
@@ -117,6 +141,17 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
                 Ui.dp(context, 34), Ui.dp(context, 34), Gravity.TOP or Gravity.END).apply {
                 topMargin = Ui.dp(context, 8)
                 rightMargin = Ui.dp(context, 50)
+            })
+            addView(statsBtn, FrameLayout.LayoutParams(
+                Ui.dp(context, 34), Ui.dp(context, 34), Gravity.TOP or Gravity.END).apply {
+                topMargin = Ui.dp(context, 8)
+                rightMargin = Ui.dp(context, 92)
+            })
+            addView(statsText, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START).apply {
+                topMargin = Ui.dp(context, 50)
+                leftMargin = Ui.dp(context, 10)
             })
         })
 
@@ -169,6 +204,20 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
             Toast.LENGTH_SHORT).show()
     }
 
+    private fun toggleStats() {
+        statsOn = !statsOn
+        statsText.visibility = if (statsOn) View.VISIBLE else View.GONE
+        if (statsOn) refreshStats() else statsHandler.removeCallbacksAndMessages(null)
+    }
+
+    /** 每秒刷新一次面板; 关掉面板就停, 不做无谓的唤醒 */
+    private fun refreshStats() {
+        if (!statsOn || isFinishing) return
+        client.stats.pendingPackets = packets.size
+        statsText.text = client.stats.snapshot()
+        statsHandler.postDelayed({ refreshStats() }, 1000)
+    }
+
     private fun updateAudioIcon() {
         audioBtn.background = Ui.circleButton(this,
             if (audioOn) Icons.SoundOn(this) else Icons.SoundOff(this),
@@ -195,8 +244,22 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
     override fun onCodecMeta(width: Int, height: Int) {
         videoW = width
         videoH = height
-        metaReady.countDown()
+        metaLatch.countDown() // 放行解码循环去建解码器
         runOnUiThread { fitSurface() }
+    }
+
+    /** 电脑端重启了编码器: 让当前解码器这一代作废, 等新 meta 再建 */
+    override fun onVideoReset() {
+        generation++
+        packets.clear()
+        packets.offer(poison) // 把阻塞在 take() 的解码线程唤醒
+        waitingForKeyframe = false
+        synchronized(recvAt) { recvAt.clear() }
+        metaLatch = CountDownLatch(1)
+        runOnUiThread {
+            statusText.visibility = View.VISIBLE
+            statusText.text = "正在调整画质…"
+        }
     }
 
     /**
@@ -207,13 +270,21 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
         if (packets.size >= MAX_PENDING_PACKETS) {
             packets.clear()
             waitingForKeyframe = true
-            droppedBacklog++
+            client.stats.droppedBacklog++
         }
         if (waitingForKeyframe) {
             if (!isConfig && !isKeyframe(data)) return
             waitingForKeyframe = false
         }
+        // 记下收到时刻, 上屏时按 PTS 反查, 得到"收到→上屏"的真实耗时
+        if (!isConfig) {
+            synchronized(recvAt) {
+                if (recvAt.size > 240) recvAt.clear() // 只是防泄漏, 正常不会涨到这里
+                recvAt[ptsUs] = System.nanoTime()
+            }
+        }
         packets.offer(Packet(isConfig, ptsUs, data))
+        client.stats.pendingPackets = packets.size
     }
 
     /** 从 Annex-B 起始码后的 NAL 头判断关键帧 (H.264: IDR=5; H.265: IDR_W_RADL/N_LP=19/20) */
@@ -245,14 +316,28 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
 
     // ---- 解码 ----
 
+    /**
+     * 解码主循环。之所以是循环: 电脑端换码率时会重启编码器, 届时要丢掉旧解码器、
+     * 等新的 codec meta 再建一个 —— 用旧解码器解新码流会直接黑屏。
+     */
     private fun runDecoder() {
         try {
             surfaceReady.await()
-            metaReady.await()
         } catch (_: InterruptedException) {
             return
         }
-        if (!running) return
+        while (running) {
+            try {
+                metaLatch.await()
+            } catch (_: InterruptedException) {
+                return
+            }
+            if (!running) return
+            decodeOneGeneration()
+        }
+    }
+
+    private fun decodeOneGeneration() {
 
         val codec: MediaCodec
         val mime = Codecs.mimeFor(videoFourcc)
@@ -273,12 +358,13 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
             return
         }
 
-        thread(name = "decoder-output") { drainOutput(codec) }
+        val gen = generation
+        thread(name = "decoder-output") { drainOutput(codec, gen) }
 
         var firstConfigSent = false
         var pendingConfig: ByteArray? = null // 旋转后的新 SPS/PPS: 拼在下一帧前内联送入
         try {
-            while (running) {
+            while (running && gen == generation) {
                 val p = packets.take()
                 if (p === poison) break
                 if (p.isConfig && firstConfigSent) {
@@ -300,11 +386,12 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
                 }
             }
         } catch (e: Exception) {
-            if (running) onDisconnected("解码中断: ${e.message}")
+            if (running && gen == generation) onDisconnected("解码中断: ${e.message}")
         } finally {
-            running = false
             runCatching { codec.stop() }
             runCatching { codec.release() }
+            // 只有"不是因为换代而退出"时才结束整个播放; 换代要留着继续下一轮
+            if (gen == generation) running = false
         }
     }
 
@@ -313,10 +400,10 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
      * 若解码器一次吐出多帧(网络抖动后追赶), 把旧的以 render=false 丢掉 ——
      * 投屏是实时画面, 播放过期帧只会让延迟固化下来。
      */
-    private fun drainOutput(codec: MediaCodec) {
+    private fun drainOutput(codec: MediaCodec, gen: Int) {
         val info = MediaCodec.BufferInfo()
         try {
-            while (running) {
+            while (running && gen == generation) {
                 var idx = codec.dequeueOutputBuffer(info, 100_000)
                 if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     onOutputFormat(codec.outputFormat)
@@ -333,10 +420,16 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
                         continue
                     }
                     codec.releaseOutputBuffer(idx, false) // 丢掉旧帧, 不上屏
-                    droppedLate++
+                    client.stats.droppedLate++
                     idx = next
                 }
+                val shownPts = info.presentationTimeUs
                 codec.releaseOutputBuffer(idx, true)
+                synchronized(recvAt) {
+                    recvAt.remove(shownPts)?.let {
+                        client.stats.onDisplayLatency((System.nanoTime() - it) / 1_000_000)
+                    }
+                }
             }
         } catch (_: Exception) {
             // codec 停止时的 IllegalStateException, 正常退出

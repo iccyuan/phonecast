@@ -375,11 +375,6 @@ func (e *engine) SwitchDevice(serialID string) {
 // 否则第二次会话 app_process 因 CLASSPATH 失效直接 Abort。
 func (e *engine) runWatched(conn net.Conn, viaLan bool) {
 	e.setState("投屏中 · 设备名 " + *room)
-	if out, err := adbRun(e.adb, "push", e.jar, remoteJarPath); err != nil {
-		log.Printf("会话前 adb push 失败: %v\n%s", err, out)
-		e.setState("运行中 · 设备名 " + *room)
-		return
-	}
 	fw := NewFrameWriter(conn)
 	// 告诉手机端"你正在看哪台手机", 列表里显示真实机型而不是设备名
 	fw.WriteFrame(ChDeviceInfo, []byte(deviceLabel()))

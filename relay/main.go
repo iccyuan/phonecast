@@ -150,15 +150,10 @@ func parseAdbDevices(out string) (ready []string, unauthorized bool) {
 
 // runSession: 启动 scrcpy-server, 把三条 socket 桥接到 viewerConn 上的 v2 帧流。
 // 任一关键通路断开即整体清理; 音频通路失败只降级不拆会话。
+// runSession: 一个观看端连接对应一次会话。会话内部可以多次重启编码器(改码率),
+// 观看端连接始终保持 —— 上行(控制/开关/上报)常驻, 只有编码那一段重来。
 func runSession(adb string, viewerConn net.Conn, info clientInfo, viaLan bool) {
-	scid := randomToken(4)
-	forwardSpec := fmt.Sprintf("tcp:%d", *localPort)
-	if out, err := adbRun(adb, "forward", forwardSpec, "localabstract:scrcpy_"+scid); err != nil {
-		log.Printf("adb forward 失败: %v\n%s", err, out)
-		return
-	}
-	defer adbRun(adb, "forward", "--remove", forwardSpec)
-
+	fw := NewFrameWriter(viewerConn)
 	codec := pickCodec(info)
 	size := pickMaxSize(info)
 	rate := pickBitRate(size, codec, viaLan)
@@ -166,6 +161,95 @@ func runSession(adb string, viewerConn net.Conn, info clientInfo, viaLan bool) {
 	log.Printf("[编码] %s, 长边 %d(%s), %d kbps, 音频 %v, 路径 %s",
 		codec, size, *resolution, rate/1000, wantAudio,
 		map[bool]string{true: "局域网", false: "中继"}[viaLan])
+
+	var ctrl atomic.Pointer[net.Conn] // 当前编码会话的控制通道, 重启时会换
+	restartCh := make(chan int, 1)
+	ad := newAdaptor(rate, func(r int) {
+		select {
+		case restartCh <- r:
+		default: // 已有待处理的调整, 丢掉这次
+		}
+	})
+	viewerGone := make(chan struct{})
+
+	// 上行常驻: 编码器重启期间, 触摸和开关依然要能用
+	go func() {
+		defer close(viewerGone)
+		for {
+			ch, payload, err := ReadFrame(viewerConn)
+			if err != nil {
+				log.Printf("观看端断开 (%v)", err)
+				return
+			}
+			switch ch {
+			case ChControl:
+				if c := ctrl.Load(); c != nil {
+					(*c).Write(payload)
+				}
+			case ChAudioToggle:
+				if len(payload) == 1 {
+					on := payload[0] == 1
+					audioMuted.Store(!on)
+					log.Printf("[音频] 观看端%s声音转发", map[bool]string{true: "开启", false: "关闭"}[on])
+				}
+			case ChLatencyPing:
+				fw.WriteFrame(ChLatencyPing, payload) // 原样回弹, 观看端自己算 RTT
+			case ChNetReport:
+				ad.Report(parseNetReport(payload))
+			}
+		}
+	}()
+
+	for gen := 0; ; gen++ {
+		if gen > 0 {
+			// 编码参数变了: 先通知观看端重建解码器, 否则它会拿旧解码器解新码流
+			fw.WriteFrame(ChVideoReset, nil)
+		}
+		stop := make(chan struct{})
+		go func() { // 把重启请求转成本轮编码的停止信号
+			select {
+			case r := <-restartCh:
+				rate = r
+				close(stop)
+			case <-viewerGone:
+				close(stop)
+			}
+		}()
+
+		encodeOnce(adb, fw, codec, size, rate, wantAudio, &ctrl, stop)
+
+		select {
+		case <-viewerGone:
+			return
+		default:
+		}
+		// 只有在"因换码率而停"时才继续下一轮; 其它原因(手机拔线等)结束会话
+		select {
+		case <-stop:
+			log.Printf("[自适应] 以 %d kbps 重启编码", rate/1000)
+			time.Sleep(300 * time.Millisecond)
+		default:
+			return
+		}
+	}
+}
+
+// encodeOnce: 启动一次 scrcpy-server 并把媒体流泵给观看端, 直到出错或收到停止信号。
+func encodeOnce(adb string, fw *FrameWriter, codec string, size, rate int, wantAudio bool,
+	ctrl *atomic.Pointer[net.Conn], stop chan struct{}) {
+	// 每次启动编码器前都要重推 jar: scrcpy-server 在 cleanup=true 下会把自己的 jar 删掉,
+	// 所以同一会话里换码率重启时, 上一轮已经把它删没了(表现为 app_process "Aborted")。
+	if out, err := adbRun(adb, "push", resolveJar(), remoteJarPath); err != nil {
+		log.Printf("推送 scrcpy-server 失败: %v\n%s", err, out)
+		return
+	}
+	scid := randomToken(4)
+	forwardSpec := fmt.Sprintf("tcp:%d", *localPort)
+	if out, err := adbRun(adb, "forward", forwardSpec, "localabstract:scrcpy_"+scid); err != nil {
+		log.Printf("adb forward 失败: %v\n%s", err, out)
+		return
+	}
+	defer adbRun(adb, "forward", "--remove", forwardSpec)
 
 	args := append(adbBaseArgs(), "shell",
 		"CLASSPATH="+remoteJarPath, "app_process", "/", "com.genymobile.scrcpy.Server", serverVersion,
@@ -229,11 +313,11 @@ func runSession(adb string, viewerConn net.Conn, info clientInfo, viaLan bool) {
 		return
 	}
 	defer controlConn.Close()
-	log.Printf("scrcpy-server 就绪 (scid=%s), 开始转发 (audio=%v)", scid, wantAudio)
+	ctrl.Store(&controlConn) // 让常驻的上行 goroutine 把触摸打到这条通道上
+	defer ctrl.Store(nil)
+	log.Printf("scrcpy-server 就绪 (scid=%s), 开始转发 (audio=%v, %d kbps)", scid, wantAudio, rate/1000)
 
-	fw := NewFrameWriter(viewerConn)
 	done := make(chan string, 4)
-
 	go func() { done <- pumpMedia(fw, ChVideo, videoConn, 12) }()
 	if audioConn != nil {
 		// 音频失败(如手机A < Android 11, server 发 4 字节 0 后关流)不拆会话
@@ -241,35 +325,16 @@ func runSession(adb string, viewerConn net.Conn, info clientInfo, viaLan bool) {
 	} else {
 		fw.WriteFrame(ChAudio, make([]byte, 4)) // 主动告知观看端: 音频禁用
 	}
-	go func() { // 上行: 观看端帧 → 控制消息注入 / 音频开关
-		for {
-			ch, payload, err := ReadFrame(viewerConn)
-			if err != nil {
-				done <- fmt.Sprintf("观看端断开 (%v)", err)
-				return
-			}
-			switch ch {
-			case ChControl:
-				if _, err := controlConn.Write(payload); err != nil {
-					done <- fmt.Sprintf("控制注入中断 (%v)", err)
-					return
-				}
-			case ChAudioToggle:
-				// 观看端静音时干脆别传, 省的是公网中继的流量
-				if len(payload) == 1 {
-					on := payload[0] == 1
-					audioMuted.Store(!on)
-					log.Printf("[音频] 观看端%s声音转发", map[bool]string{true: "开启", false: "关闭"}[on])
-				}
-			}
-		}
-	}()
 	go func() { // control socket 的设备消息(剪贴板等): 读掉丢弃
 		io.Copy(io.Discard, controlConn)
 		done <- "控制下行关闭"
 	}()
 
-	log.Print(<-done) // 任一关键通路结束即拆会话, defer 链完成清理
+	select {
+	case reason := <-done: // 任一关键通路结束即收工, defer 链完成清理
+		log.Print(reason)
+	case <-stop: // 换码率或观看端断开
+	}
 }
 
 // 观看端是否临时关掉了声音(不拆流, 只是不转发, 这样随时能开回来)

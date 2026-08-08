@@ -48,6 +48,8 @@ class StreamClient(
         fun onDeviceName(name: String)
         /** 电脑端告知它当前的局域网地址, 用于刷新本地保存的直连路径 */
         fun onLanAddrs(addrs: List<String>)
+        /** 电脑端重启了编码器(换码率): 需要丢掉旧解码器, 等新的 codec meta */
+        fun onVideoReset()
         fun onDisconnected(reason: String)
     }
 
@@ -62,6 +64,9 @@ class StreamClient(
         const val CH_LAN_ADDRS = 0x24
         const val CH_CLIENT_INFO = 0x30
         const val CH_AUDIO_TOGGLE = 0x31
+        const val CH_LATENCY_PING = 0x32
+        const val CH_NET_REPORT = 0x33
+        const val CH_VIDEO_RESET = 0x25
         const val FLAG_CONFIG = 1L shl 63
         const val PTS_MASK = (1L shl 62) - 1 // bit62=关键帧标记
         const val MAX_FRAME = 8 shl 20
@@ -71,6 +76,13 @@ class StreamClient(
     private val sendQueue = LinkedBlockingQueue<ByteArray>()
     @Volatile private var closed = false
     @Volatile private var wantAudio = true
+    // 编码器重启后, 视频与【音频】的 codec meta 都会重发一遍, 两个标志位都要跟着重置。
+    // 只重置视频的话, 4 字节的音频 meta 会被当成数据包解析而抛异常。
+    private var videoMetaSeen = false
+    private var audioMetaSeen = false
+
+    /** 链路指标, 播放页读它做展示 */
+    val stats = Stats()
 
     fun start() = thread(name = "stream-reader") { runReader() }
 
@@ -123,9 +135,8 @@ class StreamClient(
             // 上报本机屏幕与解码能力: 电脑据此决定编码分辨率与是否用 H.265
             sendFrame(CH_CLIENT_INFO, clientInfo().toByteArray())
             thread(name = "stream-sender") { runSender() }
+            thread(name = "latency-ping") { runPing() }
 
-            var videoMetaSeen = false
-            var audioMetaSeen = false
             while (!closed) {
                 val ch = input.readUnsignedByte()
                 val size = input.readInt()
@@ -140,14 +151,31 @@ class StreamClient(
                         val fourcc = ByteArray(4).also { buf.get(it) }
                         listener.onVideoCodec(String(fourcc).trim { it.code == 0 })
                         listener.onCodecMeta(buf.int, buf.int)
-                    } else emitMedia(data, listener::onPacket)
+                    } else {
+                        countMedia(CH_VIDEO, data.size)
+                        emitMedia(data, listener::onPacket)
+                    }
                     CH_AUDIO -> if (!audioMetaSeen) {
                         audioMetaSeen = true
                         if (ByteBuffer.wrap(data).int == 0) listener.onAudioDisabled("手机A 端音频不可用")
-                    } else emitMedia(data, listener::onAudioPacket)
+                    } else {
+                        countMedia(CH_AUDIO, data.size)
+                        emitMedia(data, listener::onAudioPacket)
+                    }
                     CH_DEVICE_INFO -> listener.onDeviceName(String(data))
                     CH_LAN_ADDRS -> listener.onLanAddrs(
                         String(data).split(',').map { it.trim() }.filter { it.isNotEmpty() })
+                    CH_VIDEO_RESET -> {
+                        // 电脑换了编码参数并重启了编码器: 必须重建解码器, 并等待新的 meta
+                        videoMetaSeen = false
+                        audioMetaSeen = false
+                        listener.onVideoReset()
+                    }
+                    CH_LATENCY_PING -> if (data.size == 8) {
+                        // 回弹的是本机发出去的时间戳, 相减即 RTT, 不掺入对端时钟
+                        val sent = ByteBuffer.wrap(data).long
+                        stats.onRtt((System.nanoTime() - sent) / 1_000_000)
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -201,8 +229,13 @@ class StreamClient(
     }
 
     private inline fun emitMedia(frame: ByteArray, emit: (Boolean, Long, ByteArray) -> Unit) {
+        if (frame.size < 8) return // 防御: meta 与数据包错位时不要炸掉整条读线程
         val ptsAndFlags = ByteBuffer.wrap(frame).long
         emit(ptsAndFlags and FLAG_CONFIG != 0L, ptsAndFlags and PTS_MASK, frame.copyOfRange(8, frame.size))
+    }
+
+    private fun countMedia(ch: Int, size: Int) {
+        if (ch == CH_VIDEO) stats.onVideo(size) else stats.onAudio(size)
     }
 
     private fun handshake(): ByteArray {
@@ -222,6 +255,30 @@ class StreamClient(
         val dm = Resources.getSystem().displayMetrics
         val h265 = Codecs.canDecode(MediaFormat.MIMETYPE_VIDEO_HEVC)
         return "w=${dm.widthPixels};h=${dm.heightPixels};h265=${if (h265) 1 else 0};audio=${if (wantAudio) 1 else 0}"
+    }
+
+    /**
+     * 每秒探一次 RTT(探测帧 13 字节, 开销可忽略), 每两秒上报一次拥塞信号。
+     * 上报的是【观看端看到的体感】—— 卡不卡是这一端说了算, 不是发送端的发送量说了算。
+     */
+    private fun runPing() {
+        var tick = 0
+        var lastDrops = 0L
+        while (!closed) {
+            sendQueue.offer(frameBytes(CH_LATENCY_PING,
+                ByteBuffer.allocate(8).putLong(System.nanoTime()).array()))
+            if (++tick % 2 == 0) {
+                val drops = stats.droppedBacklog + stats.droppedLate
+                val report = "rtt=${stats.rttP95()};drops=${drops - lastDrops};pending=${stats.pendingPackets}"
+                lastDrops = drops
+                sendQueue.offer(frameBytes(CH_NET_REPORT, report.toByteArray()))
+            }
+            try {
+                Thread.sleep(1000)
+            } catch (_: InterruptedException) {
+                return
+            }
+        }
     }
 
     /** 运行中切换声音: 关掉后电脑直接不发, 省的是链路流量而不只是本机音量 */

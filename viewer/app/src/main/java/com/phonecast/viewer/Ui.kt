@@ -382,6 +382,23 @@ object Icons {
         }
     }
 
+    /** 指标面板: 圆圈中的 i */
+    class Info(c: Context, color: Int = Color.WHITE) : Base(color) {
+        private val ring = stroke(color, Ui.dpf(c, 1.8f))
+        private val dot = fill(color)
+        private val bar = stroke(color, Ui.dpf(c, 2f))
+        private val dotR = Ui.dpf(c, 1.2f)
+        override fun draw(canvas: Canvas) {
+            val b = bounds
+            val r = minOf(b.width(), b.height()) * 0.32f
+            val cx = b.exactCenterX()
+            val cy = b.exactCenterY()
+            canvas.drawCircle(cx, cy, r, ring)
+            canvas.drawCircle(cx, cy - r * 0.42f, dotR, dot)
+            canvas.drawLine(cx, cy - r * 0.08f, cx, cy + r * 0.45f, bar)
+        }
+    }
+
     /** 声音开: 喇叭 + 两道声波 */
     class SoundOn(c: Context, color: Int = Color.WHITE) : Base(color) {
         private val p = stroke(color, Ui.dpf(c, 2f))

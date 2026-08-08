@@ -30,8 +30,8 @@ android {
         minSdk = 24
         targetSdk = 34
         // versionName 必须与发布 tag 一致, 否则更新检查会反复提示同一个版本
-        versionCode = 13
-        versionName = "0.9.0"
+        versionCode = 14
+        versionName = "0.9.1"
     }
 
     signingConfigs {

@@ -50,18 +50,13 @@ object Updater {
                     if (manual) Toast.makeText(a, "检查更新失败,请检查网络", Toast.LENGTH_SHORT).show()
                     return@runOnUiThread
                 }
-                val (latest, url) = result
+                val (latest, url, notes) = result
                 val cur = currentVersion(a)
                 if (!isNewer(latest, cur)) {
                     if (manual) Toast.makeText(a, "当前 v$cur 已是最新版本", Toast.LENGTH_SHORT).show()
                     return@runOnUiThread
                 }
-                AlertDialog.Builder(a, android.R.style.Theme_Material_Dialog_Alert)
-                    .setTitle("发现新版本 v$latest")
-                    .setMessage("当前版本 v$cur。将在应用内下载并自动打开安装。")
-                    .setNegativeButton("以后再说", null)
-                    .setPositiveButton("立即更新") { _, _ -> downloadAndInstall(a, url, latest) }
-                    .show()
+                Dialogs.update(a, latest, cur, notes) { downloadAndInstall(a, url, latest) }
             }
         }
     }
@@ -69,53 +64,35 @@ object Updater {
     /** 下载 APK 并在完成后拉起安装; 进度对话框可取消 */
     private fun downloadAndInstall(a: Activity, url: String, version: String) {
         val cancelled = AtomicBoolean(false)
-
-        val bar = ProgressBar(a, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max = 100
-            isIndeterminate = true
-        }
-        val label = TextView(a).apply {
-            text = "正在下载 v$version…"
-            setTextColor(Ui.TEXT)
-            textSize = 14f
-        }
-        val body = LinearLayout(a).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_VERTICAL
-            val p = Ui.dp(a, 24)
-            setPadding(p, p, p, p)
-            addView(label)
-            addView(bar, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(a, 16) })
-        }
-        val dialog = AlertDialog.Builder(a, android.R.style.Theme_Material_Dialog_Alert)
-            .setTitle("更新")
-            .setView(body)
-            .setNegativeButton("取消") { _, _ -> cancelled.set(true) }
-            .setOnCancelListener { cancelled.set(true) }
-            .show()
+        val dialog = Dialogs.progress(a, "更新到 v$version") { cancelled.set(true) }
 
         thread(name = "update-download") {
             val target = File(UpdateProvider.updateDir(a), "phonecast-$version.apk")
-            val ok = runCatching { download(url, target, cancelled) { done, total ->
-                a.runOnUiThread {
-                    if (total > 0) {
-                        bar.isIndeterminate = false
-                        bar.progress = (done * 100 / total).toInt()
-                        label.text = "正在下载 v$version… ${done / 1024 / 1024}MB / ${total / 1024 / 1024}MB"
-                    }
+            var failure: String? = null
+            val ok = runCatching {
+                download(url, target, cancelled) { done, total ->
+                    a.runOnUiThread { dialog.update(done, total) }
                 }
-            } }.getOrElse { false }
+            }.getOrElse {
+                failure = it.message ?: it.javaClass.simpleName
+                false
+            }
 
             a.runOnUiThread {
-                runCatching { dialog.dismiss() }
+                dialog.dismiss()
                 if (a.isFinishing || a.isDestroyed) return@runOnUiThread
                 when {
                     cancelled.get() -> target.delete()
                     !ok -> {
                         target.delete()
-                        Toast.makeText(a, "下载失败,请稍后重试", Toast.LENGTH_LONG).show()
+                        // 国内直连 GitHub 经常被重置, 与其只说"失败", 不如给出原因和退路
+                        Dialogs.confirm(a, "下载失败",
+                            (failure?.let { "原因: $it\n\n" } ?: "") +
+                                "国内网络常常无法直接访问 GitHub。可以改用浏览器下载" +
+                                "(浏览器能走系统代理),下载完成后按提示安装。",
+                            "用浏览器下载",
+                            { a.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) },
+                            "稍后再说")
                     }
                     else -> install(a, target)
                 }
@@ -169,15 +146,12 @@ object Updater {
             !a.packageManager.canRequestPackageInstalls()) {
             a.getSharedPreferences(PREFS, Activity.MODE_PRIVATE)
                 .edit().putString(KEY_PENDING, apk.absolutePath).apply()
-            AlertDialog.Builder(a, android.R.style.Theme_Material_Dialog_Alert)
-                .setTitle("需要安装权限")
-                .setMessage("系统要求先允许 PhoneCast 安装应用。点「去设置」打开开关,返回后会自动继续安装。")
-                .setNegativeButton("取消", null)
-                .setPositiveButton("去设置") { _, _ ->
+            Dialogs.confirm(a, "需要安装权限",
+                "系统要求先允许 PhoneCast 安装应用。点「去设置」打开开关,返回后会自动继续安装。",
+                "去设置", {
                     a.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
                         Uri.parse("package:${a.packageName}")))
-                }
-                .show()
+                }, "取消")
             return
         }
         launchInstaller(a, apk)
@@ -207,8 +181,10 @@ object Updater {
         if (apk.isFile) launchInstaller(a, apk)
     }
 
-    /** 返回 (版本号, APK 下载地址) */
-    private fun fetchLatest(): Pair<String, String> {
+    data class Release(val version: String, val apkUrl: String, val notes: String)
+
+    /** 返回 版本号 / APK 下载地址 / 发布说明 */
+    private fun fetchLatest(): Release {
         val conn = (URL(API).openConnection() as HttpURLConnection).apply {
             connectTimeout = 10_000
             readTimeout = 10_000
@@ -226,7 +202,11 @@ object Updater {
                 }
             }
             require(tag.isNotEmpty() && url.isNotEmpty())
-            return tag to url
+            // 发布说明去掉 GitHub 自动生成的链接尾巴, 只留人看得懂的部分
+            val notes = json.optString("body").lineSequence()
+                .filterNot { it.startsWith("**Full Changelog") || it.isBlank() }
+                .take(20).joinToString("\n").trim()
+            return Release(tag, url, notes)
         } finally {
             conn.disconnect()
         }

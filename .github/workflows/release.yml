@@ -46,13 +46,28 @@ jobs:
       - name: Prepare signing key
         env:
           KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
         run: |
-          if [ -n "$KEYSTORE_B64" ]; then
-            echo "$KEYSTORE_B64" | base64 -d > "$GITHUB_WORKSPACE/viewer/release.jks"
-            echo "SIGNED=1" >> "$GITHUB_ENV"
-          else
+          set -u
+          KEY_PATH="$GITHUB_WORKSPACE/viewer/release.jks"
+          if [ -z "${KEYSTORE_B64:-}" ]; then
             echo "::warning::未配置 SIGNING_KEYSTORE_B64, 将产出 debug 签名包(无法覆盖升级正式版)"
+            exit 0
           fi
+          # 从 Windows 复制粘贴常会带进 \r 或换行, base64 -d 会因此报错
+          printf '%s' "$KEYSTORE_B64" | tr -d '\r\n \t' | base64 -d > "$KEY_PATH" || {
+            echo "::error::SIGNING_KEYSTORE_B64 不是合法的 base64, 请重新复制(整行, 无空格换行)"
+            exit 1
+          }
+          SIZE=$(stat -c%s "$KEY_PATH")
+          echo "keystore 已还原, ${SIZE} 字节"
+          [ "$SIZE" -gt 0 ] || { echo "::error::还原出来是空文件"; exit 1; }
+          # 用口令试开一次, 口令错的话在这里就能说清楚, 不必等到签名步骤
+          if ! keytool -list -keystore "$KEY_PATH" -storepass "$STORE_PASSWORD" > /dev/null 2>&1; then
+            echo "::error::keystore 打不开: SIGNING_STORE_PASSWORD 不对, 或 base64 内容不完整"
+            exit 1
+          fi
+          echo "SIGNED=1" >> "$GITHUB_ENV"
 
       - name: Build viewer APK
         working-directory: viewer

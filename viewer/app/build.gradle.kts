@@ -29,8 +29,9 @@ android {
         applicationId = "com.phonecast.viewer"
         minSdk = 24
         targetSdk = 34
-        versionCode = 7
-        versionName = "0.7.0"
+        // versionName 必须与发布 tag 一致, 否则更新检查会反复提示同一个版本
+        versionCode = 8
+        versionName = "0.7.2"
     }
 
     signingConfigs {

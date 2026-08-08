@@ -22,7 +22,8 @@ jobs:
       - name: Build relay (Windows tray)
         working-directory: relay
         env: { GOOS: windows, GOARCH: amd64 }
-        run: go build -trimpath -ldflags "-H=windowsgui -s -w" -o ../dist/phonecast-relay.exe .
+        # 版本号从 tag 注入, 保证与 tag 一致 (不一致会导致更新检查反复误报)
+        run: go build -trimpath -ldflags "-H=windowsgui -s -w -X main.appVersion=${GITHUB_REF_NAME#v}" -o ../dist/phonecast-relay.exe .
 
       - name: Build hub (linux + windows)
         working-directory: hub

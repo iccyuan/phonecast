@@ -16,10 +16,12 @@ import (
 	"time"
 )
 
+// appVersion 必须与发布 tag 一致: 更新检查是拿它跟 GitHub 上的 tag_name 比,
+// 落后于已发布版本会导致每次启动都误报"有新版本"。CI 发版时用
+// -ldflags "-X main.appVersion=<tag>" 从 tag 注入覆盖, 这里的值只管本地构建。
+var appVersion = "0.9.2"
+
 const (
-	// 必须与发布 tag 一致: 更新检查是拿它跟 GitHub 上的 tag_name 比,
-	// 落后于已发布版本会导致每次启动都误报"有新版本"。
-	appVersion   = "0.9.1"
 	releasesAPI  = "https://api.github.com/repos/iccyuan/phonecast/releases/latest"
 	relayAssetZip = "phonecast-relay-windows.zip"
 	relayExeName  = "phonecast-relay.exe"

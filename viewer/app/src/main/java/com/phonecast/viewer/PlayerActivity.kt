@@ -14,6 +14,7 @@ import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -70,6 +71,7 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enterImmersive()
 
         surfaceView = SurfaceView(this).apply {
             keepScreenOn = true
@@ -94,8 +96,8 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
         }
 
         // 不再放「返回/主页/多任务」三个键: 手势时代直接在画面里比划更自然,
-        // 那三个键反而占地方。取而代之的是画面四周留出安全边距(见 fitSurface),
-        // 边距内是本机手势区, 边距内侧的画面区则把本机手势屏蔽掉交给被控手机。
+        // 那三个键反而占地方。本机与被控手势的冲突由沉浸式全屏解决(见 enterImmersive):
+        // 系统栏隐藏后边缘滑动直达被控手机, 想用本机手势就先轻扫呼出系统栏。
         val exitBtn = View(this).apply {
             background = Ui.circleButton(this@PlayerActivity,
                 Icons.Close(this@PlayerActivity, Color.WHITE), 0x99000000.toInt(), 9)
@@ -161,6 +163,34 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
             addrs, room, intent.getStringExtra("code") ?: "", Tokens.get(this, room), this)
         client.start()
         thread(name = "decoder-input") { runDecoder() }
+    }
+
+    /**
+     * 粘性沉浸式全屏: 隐藏状态栏/导航栏后, 本机的系统手势(边缘返回/底部 Home)不再直接
+     * 生效, 边缘滑动会传给画面发到被控手机; 需要本机手势时先从边缘轻扫呼出系统栏再滑。
+     * 单靠 systemGestureExclusionRects 解决不了冲突: 返回手势每边最多豁免 200dp,
+     * 底部 Home 手势区更是完全不可豁免。
+     */
+    private fun enterImmersive() {
+        if (Build.VERSION.SDK_INT >= 28) {
+            window.attributes = window.attributes.apply {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+        @Suppress("DEPRECATION")
+        window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+            or View.SYSTEM_UI_FLAG_FULLSCREEN
+            or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+            or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+            or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION)
+    }
+
+    /** 系统对话框等抢走焦点会清掉沉浸态, 拿回焦点时补上 */
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) enterImmersive()
     }
 
     // ---- StreamClient.Listener (非 UI 线程) ----
@@ -454,29 +484,22 @@ class PlayerActivity : Activity(), StreamClient.Listener, SurfaceHolder.Callback
 
     /**
      * 按视频宽高比等比缩放并居中, 让触摸坐标可线性映射。
-     *
-     * 关键点: 当被控手机的分辨率不小于本机时, 画面会铺到屏幕边缘, 此时从边缘发起的
-     * 滑动会被【本机】的系统手势(返回/主页)截走, 传不到被控手机。所以这种情况下四周
-     * 留出一圈空白: 空白区是本机手势区, 画面区是被控手机的操作区, 两者互不打架。
+     * 边缘手势冲突由沉浸式全屏解决(见 enterImmersive), 画面可以放心铺满。
      */
     private fun fitSurface() {
         val vw = videoW
         val vh = videoH
         if (vw == 0 || vh == 0 || container.width == 0) return
 
-        val dm = resources.displayMetrics
-        val remoteNotSmaller = vw >= dm.widthPixels || vh >= dm.heightPixels
-        val inset = if (remoteNotSmaller) Ui.dp(this, 22) else 0
-
-        val availW = (container.width - inset * 2).coerceAtLeast(1)
-        val availH = (container.height - inset * 2).coerceAtLeast(1)
+        val availW = container.width.coerceAtLeast(1)
+        val availH = container.height.coerceAtLeast(1)
         val scale = minOf(availW.toFloat() / vw, availH.toFloat() / vh)
         val w = (vw * scale).toInt()
         val h = (vh * scale).toInt()
         surfaceView.layoutParams = FrameLayout.LayoutParams(w, h, Gravity.CENTER)
 
-        // 画面区内屏蔽本机系统手势, 让边缘滑动落到被控手机上
-        // (系统对每条边的豁免高度有上限, 拿不满也能显著改善)
+        // 辅助手段: 系统栏被临时呼出的几秒里, 尽量豁免画面区的本机手势
+        // (返回手势每边最多豁免 200dp、底部 Home 区不可豁免, 兜底靠沉浸式)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             surfaceView.post {
                 surfaceView.systemGestureExclusionRects =

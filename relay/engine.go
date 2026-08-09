@@ -114,7 +114,7 @@ func (e *engine) run(ctx context.Context) {
 		return
 	}
 	if out, err := adbRun(e.adb, "push", e.jar, remoteJarPath); err != nil {
-		log.Printf("adb push 失败: %v\n%s", err, out)
+		log.Printf("[adb] push 失败: %v\n%s", err, out)
 		alertf("adb push 失败: %v", err)
 		go e.Stop()
 		return
@@ -137,7 +137,7 @@ func (e *engine) waitForDevice(ctx context.Context) bool {
 	for ctx.Err() == nil {
 		out, err := adbRun(e.adb, "devices")
 		if err != nil {
-			log.Printf("运行 adb 失败: %v\n%s", err, out)
+			log.Printf("[adb] 运行失败: %v\n%s", err, out)
 			alertf("运行 adb 失败: %v", err)
 			go e.Stop()
 			return false
@@ -151,7 +151,7 @@ func (e *engine) waitForDevice(ctx context.Context) bool {
 			// 配置里指定的手机不在场: 等它, 不要擅自换一台
 		} else if len(ready) > 0 {
 			if len(ready) > 1 {
-				log.Printf("检测到 %d 台手机, 先用第一台 (托盘菜单「选择被投屏手机」可切换)", len(ready))
+				log.Printf("[设备] 检测到 %d 台手机, 先用第一台 (托盘菜单「选择被投屏手机」可切换)", len(ready))
 			}
 			*serial = ready[0]
 			rememberDevice(e.adb, *serial)

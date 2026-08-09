@@ -64,7 +64,7 @@ func messageBox(title, text string, flags uint32) int {
 // alertf: 需要用户注意的错误 —— 有控制台就打印, 没有就弹窗。
 func alertf(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
-	log.Print(msg)
+	log.Printf("[提示] %s", msg)
 	if !hasConsole {
 		messageBox("PhoneCast", msg, mbOK|mbIconWarning)
 	}
@@ -73,7 +73,7 @@ func alertf(format string, args ...any) {
 // die: 致命错误, 提示后退出。
 func die(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
-	log.Print(msg)
+	log.Printf("[致命] %s", msg)
 	if hasConsole {
 		fmt.Fprintln(os.Stderr, msg)
 	} else {

@@ -4,11 +4,13 @@
 // 观看端接入两种方式, 可同时开启:
 //   - 直连: 手机B 连本机 -listen 端口(同局域网/adb reverse)
 //   - 中继: agent 反向连到云端 hub(-hub), 手机B 从公网连 hub, 按配对码撮合
+//
 // 双击运行 → 任务栏托盘图标右键: 启动/停止/重新运行/复制连接信息/日志/退出。
 // 从终端启动则同时把日志打到终端; 日志始终写 exe 旁的 phonecast.log。
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"flag"
@@ -32,20 +34,20 @@ const (
 )
 
 var (
-	adbPath   = flag.String("adb", "", "adb 路径 (默认: PATH 中的 adb, 找不到再试 D:\\Develop\\Android\\platform-tools\\adb.exe)")
-	serial    = flag.String("s", "", "adb 设备序列号 (多台设备时必填)")
-	listen    = flag.String("listen", ":27184", "直连模式监听地址, 空字符串关闭直连")
-	hubAddr   = flag.String("hub", "", "hub 地址 host:port, 设置后启用中继模式")
-	key       = flag.String("key", "", "接入密钥: 直连时校验观看端, 中继时提交给 hub (必填)")
-	room      = flag.String("room", "", "配对码, 手机B 用它找到本机 (默认随机生成)")
-	localPort = flag.Int("local-port", 27183, "adb forward 用的本地端口")
-	serverJar = flag.String("server", "", "scrcpy-server 文件路径 (默认: exe 同目录下的 scrcpy-server-v2.7)")
-	maxSize   = flag.Int("max-size", 1440, "视频长边最大像素 (0=原始分辨率); 仅在观看端未上报屏幕尺寸时用")
+	adbPath    = flag.String("adb", "", "adb 路径 (默认: PATH 中的 adb, 找不到再试 D:\\Develop\\Android\\platform-tools\\adb.exe)")
+	serial     = flag.String("s", "", "adb 设备序列号 (多台设备时必填)")
+	listen     = flag.String("listen", ":27184", "直连模式监听地址, 空字符串关闭直连")
+	hubAddr    = flag.String("hub", "", "hub 地址 host:port, 设置后启用中继模式")
+	key        = flag.String("key", "", "接入密钥: 直连时校验观看端, 中继时提交给 hub (必填)")
+	room       = flag.String("room", "", "配对码, 手机B 用它找到本机 (默认随机生成)")
+	localPort  = flag.Int("local-port", 27183, "adb forward 用的本地端口")
+	serverJar  = flag.String("server", "", "scrcpy-server 文件路径 (默认: exe 同目录下的 scrcpy-server-v2.7)")
+	maxSize    = flag.Int("max-size", 1440, "视频长边最大像素 (0=原始分辨率); 仅在观看端未上报屏幕尺寸时用")
 	resolution = flag.String("resolution", "auto", "分辨率策略: auto=按观看端屏幕自适应, original=被投屏手机原始分辨率")
 	videoCodec = flag.String("video-codec", "auto", "视频编码: auto=两端都支持就用 h265, 否则 h264; 也可强制 h264")
-	bitRate   = flag.Int("bit-rate", 8_000_000, "视频码率 bps (走公网中继建议 2000000-4000000)")
-	maxFps    = flag.Int("max-fps", 60, "最大帧率")
-	audio     = flag.Bool("audio", true, "转发音频 (手机A 需 Android 11+, AAC 128kbps)")
+	bitRate    = flag.Int("bit-rate", 8_000_000, "视频码率 bps (走公网中继建议 2000000-4000000)")
+	maxFps     = flag.Int("max-fps", 60, "最大帧率")
+	audio      = flag.Bool("audio", true, "转发音频 (手机A 需 Android 11+, AAC 128kbps)")
 )
 
 // 同一时刻只允许一个观看会话(scrcpy-server 单实例)。
@@ -54,7 +56,7 @@ var sessionMu sync.Mutex
 // hasConsole: 从终端启动(已附加父进程控制台)时为 true, 决定 向导/报错 用文本还是弹窗。
 var hasConsole bool
 
-// logSink: 日志汇 (文件 + 可选控制台), scrcpy server 输出也写这里。
+// logSink: 日志汇 (文件 + 可选控制台); scrcpy server 输出经 serverLogWriter 按行并入。
 var logSink io.Writer = os.Stderr
 
 func main() {
@@ -110,7 +112,7 @@ func banner() {
 	}
 	lines = append(lines, "  设备名 "+*room, "  配对码 "+pairCode()+" (6 位数字, 首次配对用)")
 	for _, l := range lines {
-		log.Print(l)
+		log.Printf("[连接] %s", l)
 	}
 }
 
@@ -178,7 +180,7 @@ func runSession(adb string, viewerConn net.Conn, info clientInfo, viaLan bool) {
 		for {
 			ch, payload, err := ReadFrame(viewerConn)
 			if err != nil {
-				log.Printf("观看端断开 (%v)", err)
+				log.Printf("[会话] 观看端断开 (%v)", err)
 				return
 			}
 			switch ch {
@@ -240,13 +242,13 @@ func encodeOnce(adb string, fw *FrameWriter, codec string, size, rate int, wantA
 	// 每次启动编码器前都要重推 jar: scrcpy-server 在 cleanup=true 下会把自己的 jar 删掉,
 	// 所以同一会话里换码率重启时, 上一轮已经把它删没了(表现为 app_process "Aborted")。
 	if out, err := adbRun(adb, "push", resolveJar(), remoteJarPath); err != nil {
-		log.Printf("推送 scrcpy-server 失败: %v\n%s", err, out)
+		log.Printf("[adb] 推送 scrcpy-server 失败: %v\n%s", err, out)
 		return
 	}
 	scid := randomToken(4)
 	forwardSpec := fmt.Sprintf("tcp:%d", *localPort)
 	if out, err := adbRun(adb, "forward", forwardSpec, "localabstract:scrcpy_"+scid); err != nil {
-		log.Printf("adb forward 失败: %v\n%s", err, out)
+		log.Printf("[adb] forward 失败: %v\n%s", err, out)
 		return
 	}
 	defer adbRun(adb, "forward", "--remove", forwardSpec)
@@ -268,11 +270,11 @@ func encodeOnce(adb string, fw *FrameWriter, codec string, size, rate int, wantA
 	var videoConn net.Conn
 	for attempt := 1; ; attempt++ {
 		srv = exec.Command(adb, args...)
-		srv.Stdout = prefixWriter("[server] ")
-		srv.Stderr = prefixWriter("[server] ")
+		srv.Stdout = &serverLogWriter{}
+		srv.Stderr = &serverLogWriter{}
 		hideWindow(srv) // windowsgui 下防止 adb 弹出控制台窗口
 		if err := srv.Start(); err != nil {
-			log.Printf("启动 scrcpy-server 失败: %v", err)
+			log.Printf("[采集] 启动 scrcpy-server 失败: %v", err)
 			return
 		}
 		var err error
@@ -284,10 +286,10 @@ func encodeOnce(adb string, fw *FrameWriter, codec string, size, rate int, wantA
 		srv.Process.Kill()
 		srv.Wait()
 		if attempt >= 2 {
-			log.Printf("连接 video socket 失败: %v, 放弃", err)
+			log.Printf("[采集] 连接 video socket 失败: %v, 放弃", err)
 			return
 		}
-		log.Printf("连接 video socket 失败: %v, 重试", err)
+		log.Printf("[采集] 连接 video socket 失败: %v, 重试", err)
 		time.Sleep(time.Second)
 	}
 	defer func() {
@@ -300,7 +302,7 @@ func encodeOnce(adb string, fw *FrameWriter, codec string, size, rate int, wantA
 	if wantAudio {
 		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", *localPort), 3*time.Second)
 		if err != nil {
-			log.Printf("连接 audio socket 失败: %v", err)
+			log.Printf("[采集] 连接 audio socket 失败: %v", err)
 			return
 		}
 		audioConn = c
@@ -309,19 +311,19 @@ func encodeOnce(adb string, fw *FrameWriter, codec string, size, rate int, wantA
 
 	controlConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", *localPort), 3*time.Second)
 	if err != nil {
-		log.Printf("连接 control socket 失败: %v", err)
+		log.Printf("[采集] 连接 control socket 失败: %v", err)
 		return
 	}
 	defer controlConn.Close()
 	ctrl.Store(&controlConn) // 让常驻的上行 goroutine 把触摸打到这条通道上
 	defer ctrl.Store(nil)
-	log.Printf("scrcpy-server 就绪 (scid=%s), 开始转发 (audio=%v, %d kbps)", scid, wantAudio, rate/1000)
+	log.Printf("[采集] scrcpy-server 就绪 (scid=%s), 开始转发 (audio=%v, %d kbps)", scid, wantAudio, rate/1000)
 
 	done := make(chan string, 4)
 	go func() { done <- pumpMedia(fw, ChVideo, videoConn, 12) }()
 	if audioConn != nil {
 		// 音频失败(如手机A < Android 11, server 发 4 字节 0 后关流)不拆会话
-		go func() { log.Printf("音频通路: %s", pumpMedia(fw, ChAudio, audioConn, 4)) }()
+		go func() { log.Printf("[音频] %s", pumpMedia(fw, ChAudio, audioConn, 4)) }()
 	} else {
 		fw.WriteFrame(ChAudio, make([]byte, 4)) // 主动告知观看端: 音频禁用
 	}
@@ -332,7 +334,7 @@ func encodeOnce(adb string, fw *FrameWriter, codec string, size, rate int, wantA
 
 	select {
 	case reason := <-done: // 任一关键通路结束即收工, defer 链完成清理
-		log.Print(reason)
+		log.Printf("[会话] %s", reason)
 	case <-stop: // 换码率或观看端断开
 	}
 }
@@ -568,9 +570,25 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%d B", n)
 }
 
-type prefixWriter string
+// serverLogWriter: 把 scrcpy-server 的输出按行并入统一日志(带时间戳与 [采集] 标签),
+// 并去掉它自带的 "[server] " 前缀, 避免出现 "[server] [server]" 双重前缀。
+type serverLogWriter struct {
+	buf []byte
+}
 
-func (p prefixWriter) Write(b []byte) (int, error) {
-	logSink.Write(append([]byte(p), b...))
+func (w *serverLogWriter) Write(b []byte) (int, error) {
+	w.buf = append(w.buf, b...)
+	for {
+		i := bytes.IndexByte(w.buf, '\n')
+		if i < 0 {
+			break
+		}
+		line := strings.TrimRight(string(w.buf[:i]), "\r")
+		w.buf = w.buf[i+1:]
+		if line == "" {
+			continue
+		}
+		log.Printf("[采集] %s", strings.TrimPrefix(line, "[server] "))
+	}
 	return len(b), nil
 }

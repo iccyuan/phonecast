@@ -38,21 +38,21 @@ func main() {
 	flag.Parse()
 	log.SetFlags(log.Ldate | log.Ltime)
 	if *hubKey == "" {
-		log.Fatal("必须用 -key 指定接入密钥")
+		log.Fatal("[启动] 必须用 -key 指定接入密钥")
 	}
 
 	ln, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
-		log.Fatalf("监听 %s 失败: %v", *listenAddr, err)
+		log.Fatalf("[启动] 监听 %s 失败: %v", *listenAddr, err)
 	}
-	log.Printf("hub 启动: 接入 %s, 状态页 %s", *listenAddr, *httpAddr)
+	log.Printf("[启动] hub 就绪: 接入 %s, 状态页 %s", *listenAddr, *httpAddr)
 
 	go serveHTTP()
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Fatalf("accept 失败: %v", err)
+			log.Fatalf("[接入] accept 失败: %v", err)
 		}
 		go handleConn(conn)
 	}
@@ -100,7 +100,7 @@ func handleConn(conn net.Conn) {
 	}
 	if subtle.ConstantTimeCompare([]byte(gotKey), []byte(*hubKey)) != 1 {
 		authLimiter.fail(ip)
-		log.Printf("[auth] %s 密钥错误 (magic=%q)", ip, magic)
+		log.Printf("[认证] %s 密钥错误 (magic=%q)", ip, magic)
 		time.Sleep(time.Second)
 		conn.Write([]byte{StatusBadKey})
 		conn.Close()
@@ -152,7 +152,7 @@ func handleAgent(conn net.Conn) {
 	roomsMu.Unlock()
 
 	conn.Write([]byte{StatusOK})
-	log.Printf("[agent] %s 注册, 配对码 %s", a.addr, maskRoom(room))
+	log.Printf("[电脑端] %s 注册, 配对码 %s", a.addr, maskRoom(room))
 
 	defer func() {
 		roomsMu.Lock()
@@ -161,7 +161,7 @@ func handleAgent(conn net.Conn) {
 		}
 		roomsMu.Unlock()
 		conn.Close()
-		log.Printf("[agent] %s 离线, 配对码 %s", a.addr, maskRoom(room))
+		log.Printf("[电脑端] %s 离线, 配对码 %s", a.addr, maskRoom(room))
 	}()
 
 	stopPing := make(chan struct{})
@@ -252,7 +252,7 @@ func handleViewer(conn net.Conn) {
 	select {
 	case agentConn = <-ch:
 	case <-time.After(10 * time.Second):
-		log.Printf("[viewer] %s 等待 agent 会话连接超时, 配对码 %s", remoteIP(conn), maskRoom(room))
+		log.Printf("[观看端] %s 等待电脑端会话连接超时, 配对码 %s", remoteIP(conn), maskRoom(room))
 		conn.Write([]byte{StatusHubErr})
 		return
 	}
@@ -391,7 +391,7 @@ func serveHTTP() {
 	mux.HandleFunc("/status", requireAuth(statusJSON, false))
 	mux.HandleFunc("/", requireAuth(statusPage, true))
 	if err := http.ListenAndServe(*httpAddr, mux); err != nil {
-		log.Fatalf("HTTP 监听失败: %v", err)
+		log.Fatalf("[启动] HTTP 监听失败: %v", err)
 	}
 }
 
@@ -474,7 +474,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if subtle.ConstantTimeCompare([]byte(r.FormValue("key")), []byte(*hubKey)) != 1 {
 		authLimiter.fail(ip)
-		log.Printf("[auth] %s 状态页登录失败", ip)
+		log.Printf("[认证] %s 状态页登录失败", ip)
 		time.Sleep(time.Second)
 		renderLogin(w, "密钥错误")
 		return
